@@ -1,0 +1,9 @@
+ohos_project_dir=ohos_project_directory_stub
+libdir=${ohos_project_dir}/out/ohos-arm-release/thirdparty/libdrm/
+includedir=${ohos_project_dir}/third_party/libdrm
+
+Name: libdrm
+Description: Userspace interface to kernel DRM services
+Version: 2.5.109
+Libs: -L${libdir} -ldrm
+Cflags: -I${includedir} -I${includedir}/include/drm/

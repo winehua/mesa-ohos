@@ -1,0 +1,9 @@
+prefix=ohos_project_directory_stub
+includedir=${prefix}/third_party/wayland_standard/egl
+
+Name: wayland-egl-backend
+Description: Backend wayland-egl interface
+Version: 3
+Libs:
+Cflags: -I${includedir}
+

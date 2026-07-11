@@ -1,0 +1,9 @@
+ohos_project_dir=ohos_project_directory_stub
+libdir=${ohos_project_dir}/out/ohos-arm-release/graphic/graphic_surface/
+includedir=${ohos_project_dir}/foundation/graphic/graphic_surface/interfaces/inner_api/surface/
+
+Name: libsurface
+Version: 2.4.1
+Description: libsurface
+Libs: -L${libdir} -lsurface.z
+Cflags: -I${includedir} -I${ohos_project_dir}/drivers/peripheral/display/interfaces/include -I${ohos_project_dir}/drivers/peripheral/base

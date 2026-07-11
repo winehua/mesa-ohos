@@ -1,0 +1,9 @@
+prefix=ohos_project_directory_stub
+libdir=${prefix}/out/ohos-arm-release/obj/third_party/wayland_standard/
+includedir=${prefix}/third_party/wayland_standard/cursor
+
+Name: wayland_cursor
+Description: Server side implementation of the Wayland cursor
+Version: 2.5.109
+Libs: -L${libdir} -llibwayland_cursor
+Cflags: -I${includedir}

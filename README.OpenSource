@@ -1,0 +1,11 @@
+[
+    {
+        "Name": "Mesa3D - MesaLib",
+        "License": "MIT license",
+        "License File": "docs/license.rst",
+        "Version Number": "25.0.1",
+        "Owner": "liaosirui@huawei.com",
+        "Upstream URL": "https://gitlab.freedesktop.org/mesa/mesa",
+        "Description": "mesa is an open-source software implementation of OpenGL, Vulkan, and other graphics API specifications."
+    }
+]

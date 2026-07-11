@@ -1,0 +1,9 @@
+ohos_project_dir=ohos_project_directory_stub
+libdir=${ohos_project_dir}/out/ohos-arm-release/hiviewdfx/hilog
+includedir=${ohos_project_dir}/base/hiviewdfx/hilog/interfaces/native/innerkits/include
+
+Name: libhilog
+Version: 2.4.1
+Description: libhilog
+Libs: -L${libdir} -lhilog
+Cflags: -I${includedir}

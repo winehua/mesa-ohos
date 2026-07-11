@@ -1,0 +1,10 @@
+prefix=ohos_project_directory_stub
+exec_prefix=${prefix}
+datarootdir=${prefix}/share
+pkgdatadir=${datarootdir}/wayland
+wayland_scanner=${prefix}/out/ohos-arm-release/clang_x64/graphic/graphic_2d/wayland_scanner
+
+Name: Wayland Scanner
+Description: Wayland scanner
+Version: 1.19.0
+

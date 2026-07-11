@@ -1,0 +1,9 @@
+prefix=ohos_project_directory_stub
+datarootdir=${prefix}/third_party
+pkgdatadir=${datarootdir}/wayland-protocols_standard
+includedir = ${prefix}/out/ohos-arm-release/gen/third_party/wayland_standard/protocol
+Name: Wayland Protocols
+Description: Wayland protocol files
+Version: 1.24
+Cflags: -I${includedir} -I${prefix}/third_party/wayland_standard/egl
+

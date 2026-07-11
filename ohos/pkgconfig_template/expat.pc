@@ -1,0 +1,10 @@
+ohos_project_dir=ohos_project_directory_stub
+libdir=${ohos_project_dir}/out/ohos-arm-release/obj/third_party/skia_folder_stub/third_party/expat
+includedir=${ohos_project_dir}/third_party/skia_folder_stub/third_party/externals/expat/expat/lib
+
+Name: expat
+Version: 2.4.1
+Description: expat XML parser
+Libs: -L${libdir} -lexpat_lib_stub
+Cflags: -I${includedir}
+expat

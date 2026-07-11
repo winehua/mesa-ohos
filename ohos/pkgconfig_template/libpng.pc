@@ -1,0 +1,9 @@
+ohos_project_dir=ohos_project_directory_stub
+libdir=${ohos_project_dir}/out/ohos-arm-release/thirdparty/libpng/
+includedir=${ohos_project_dir}/third_party/libpng
+
+Name: png
+Description: png
+Version: 2.5.109
+Libs: -L${libdir} -lpng.z
+Cflags: -I${includedir}

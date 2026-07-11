@@ -1,0 +1,11 @@
+prefix=ohos_project_directory_stub
+datarootdir=${prefix}/share
+pkgdatadir=${datarootdir}/wayland
+libdir=${prefix}/out/ohos-arm-release/graphic/graphic_2d
+includedir=${prefix}/third_party/wayland_standard/src
+
+Name: Wayland Client
+Description: Server side implementation of the Wayland protocol
+Version: 1.18.0
+Cflags: -I${includedir} -I${prefix}/out/ohos-arm-release/gen/third_party/wayland_standard/protocol
+Libs: -L${libdir} -lwayland_client.0.z

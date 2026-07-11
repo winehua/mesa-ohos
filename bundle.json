@@ -1,0 +1,51 @@
+{
+    "name": "@ohos/mesa3d",
+    "description": "mesa is an open-source software implementation of OpenGL, Vulkan, and other graphics API specifications.",
+    "version": "25.0.1",
+    "license": "MIT",
+    "publishAs": "code-segment",
+    "segment": {
+        "destPath": "third_party/mesa3d"
+    },
+    "dirs": {},
+    "scripts": {},
+    "readmePath": {
+        "en": "README.rst"
+    },
+    "component": {
+        "name": "mesa3d",
+        "subsystem": "thirdparty",
+        "syscap": [],
+        "features": [],
+        "adapted_system_type": [
+            "standard"
+        ],
+        "rom": "",
+        "ram": "",
+        "deps": {
+            "components": [
+                "c_utils",
+                "graphic_surface",
+                "hilog"
+            ],
+            "third_party": [
+                "zlib"
+            ]
+        },
+        "build": {
+            "sub_component": [
+                "//third_party/mesa3d:zink_opengl"
+            ],
+            "inner_kits": [
+                {
+                    "name": "//third_party/mesa3d:zink_opengl",
+                    "header": {
+                        "header_files": [],
+                        "header_base": []
+                    }
+                }
+            ],
+            "test": []
+        }
+    }
+}

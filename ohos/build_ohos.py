@@ -1,0 +1,43 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+# Copyright (c) 2022 Huawei Device Co., Ltd.
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+import sys
+import ntpath
+import os
+if __name__ == '__main__':
+    if len(sys.argv) < 4:
+        print("must input the OpenHarmony directory and the product name and the source dir")
+        exit(-1)
+    script_dir = os.path.split(os.path.abspath( __file__))[0]
+    run_cross_pross_cmd = 'python3 ' + script_dir + '/meson_cross_process.py ' + sys.argv[1] + ' ' + sys.argv[2]
+    os.system(run_cross_pross_cmd)
+
+    run_build_cmd = 'PKG_CONFIG_PATH=./pkgconfig '
+    run_build_cmd += 'meson setup '+ sys.argv[3] + ' build-ohos '
+    run_build_cmd += '-Dplatforms=ohos -Degl-native-platform=ohos -Ddri-drivers= -Dgallium-drivers=panfrost \
+                      -Dvulkan-drivers= -Dgbm=enabled -Degl=enabled -Dcpp_rtti=false -Dglx=disabled -Dtools=panfrost -Ddri-search-path=/system/lib '
+    run_build_cmd += '--cross-file=cross_file '
+    run_build_cmd += '--prefix=' + os.getcwd() + '/build-ohos/install'
+    print("build command: %s" %run_build_cmd)
+    os.system(run_build_cmd)
+    os.system('ninja -C build-ohos -j26')
+    os.system('ninja -C build-ohos install')

@@ -1,0 +1,11 @@
+prefix=ohos_project_directory_stub
+exec_prefix=${prefix}
+libdir=${prefix}/out/ohos-arm-release/graphic/graphic_2d/
+includedir=${prefix}/third_party/wayland_standard/egl
+
+Name: wayland-egl
+Description: Frontend wayland-egl library
+Version: 18.1.0
+Requires: wayland-client
+Libs: -L${libdir} -lwayland_client.0.z
+Cflags: -I${includedir}

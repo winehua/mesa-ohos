@@ -1,0 +1,106 @@
+# Copyright (c) 2022 Huawei Device Co., Ltd.
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+
+import("//build/config/clang/clang.gni")
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+import("//build/ohos.gni")
+mesa3d_libs_dir = "$root_build_dir/packages/phone/mesa3d"
+
+mesa3d_gallium_symlinks = [ "panfrost_dri.so" ]
+
+mesa3d_all_lib_items = [
+  [
+    "libEGL.so.1.0.0",
+    [
+      "libEGL.so",
+      "libEGL.so.1",
+      "libEGL_impl.so",
+    ],
+  ],
+  [
+    "libgbm.so.1.0.0",
+    [
+      "libgbm.so",
+      "libgbm.so.1",
+    ],
+  ],
+  [
+    "libglapi.so.0.0.0",
+    [
+      "libglapi.so",
+      "libglapi.so.0",
+    ],
+  ],
+  [
+    "libGLESv1_CM.so.1.1.0",
+    [
+      "libGLESv1_CM.so",
+      "libGLESv1_CM.so.1",
+      "libGLESv1_impl.so",
+    ],
+  ],
+  [
+    "libGLESv2.so.2.0.0",
+    [
+      "libGLESv2.so",
+      "libGLESv2.so.2",
+      "libGLESv3.so",
+      "libGLESv2_impl.so",
+      "libGLESv3_impl.so",
+    ],
+  ],
+  [
+    "libgallium_dri.so",
+    mesa3d_gallium_symlinks,
+  ],
+]
+
+action("mesa3d_build") {
+  script = "build_mesa3d.py"
+  deps = [
+    "//foundation/graphic/graphic_2d:libsurface",
+    "//third_party/expat:expat",
+  ]
+  outputs = []
+  foreach(item, mesa3d_all_lib_items) {
+    name = item[0]
+    outputs += [ "$mesa3d_libs_dir/$name" ]
+  }
+  args = [ rebase_path(root_build_dir) ]
+}
+
+mesa3d_all_lib_deps = []
+
+foreach(item, mesa3d_all_lib_items) {
+  name = item[0]
+  ohos_prebuilt_shared_library(name) {
+    source = "$mesa3d_libs_dir/$name"
+    deps = [ ":mesa3d_build" ]
+    symlink_target_name = item[1]
+    install_enable = true
+    install_images = [ system_base_dir ]
+    subsystem_name = "rockchip_products"
+    part_name = "rockchip_products"
+  }
+  mesa3d_all_lib_deps += [ ":$name" ]
+}
+
+group("mesa3d_all_libs") {
+  deps = mesa3d_all_lib_deps
+}

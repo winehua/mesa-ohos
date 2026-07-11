@@ -1,0 +1,9 @@
+ohos_project_dir=ohos_project_directory_stub
+libdir=${ohos_project_dir}/device/soc/qualcomm/sdm845/hardware/gpu
+includedir=${ohos_project_dir}/device/soc/qualcomm/sdm845/hardware/gpu/include
+
+Name: gbm
+Description: Userspace interface to kernel DRM services
+Version: 2.5.109
+Libs: -L${libdir} -llibgbm
+Cflags: -I${ohos_project_dir}/device/soc/qualcomm/sdm845/hardware/gpu/include

@@ -1,0 +1,9 @@
+ohos_project_dir=ohos_project_directory_stub
+libdir=${ohos_project_dir}/out/ohos-arm-release/thirdparty/libxml2/
+includedir=${ohos_project_dir}/third_party/libxml2/include
+
+Name: xml2
+Description: xml2
+Version: 2.9.13
+Libs: -L${libdir} -lxml2.z
+Cflags: -I${includedir}

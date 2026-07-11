@@ -1,0 +1,9 @@
+ohos_project_dir=ohos_project_directory_stub
+libdir=${ohos_project_dir}/out/ohos-arm-release/obj/third_party/libjpeg-turbo/
+includedir=${ohos_project_dir}/third_party/libjpeg-turbo
+
+Name: jpeg
+Description: jpeg
+Version: 2.5.109
+Libs: -L${libdir} -llibturbojpeg_static
+Cflags: -I${includedir}

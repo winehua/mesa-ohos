@@ -1,0 +1,13 @@
+prefix=ohos_project_directory_stub
+exec_prefix=${prefix}
+libdir=${prefix}/out/ohos-arm-release/obj/third_party/zlib
+sharedlibdir=${libdir}
+includedir=${prefix}/third_party/zlib
+
+Name: zlib
+Description: zlib compression library
+Version: 1.2.12
+
+Requires:
+Libs: -L${libdir} -L${sharedlibdir} -lz
+Cflags: -I${includedir}
