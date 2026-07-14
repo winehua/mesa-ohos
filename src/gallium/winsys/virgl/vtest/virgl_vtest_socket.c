@@ -30,6 +30,7 @@
 #include <netinet/in.h>
 #include <sys/mman.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <util/format/u_format.h>
@@ -117,6 +118,58 @@ static int virgl_block_read(int fd, void *buf, int size)
       ptr += ret;
    } while (left);
    return size;
+}
+
+static uint64_t
+winehua_now_ns(void)
+{
+   struct timespec now;
+
+   return clock_gettime(CLOCK_MONOTONIC, &now) == 0
+      ? (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec : 0;
+}
+
+static uint64_t
+winehua_wait_until_ns(uint64_t deadline_ns)
+{
+   const uint64_t started_ns = winehua_now_ns();
+   uint64_t now_ns = started_ns;
+
+   while (now_ns && now_ns < deadline_ns) {
+      const uint64_t remaining_ns = deadline_ns - now_ns;
+      struct timespec delay = {
+         .tv_sec = (time_t)(remaining_ns / 1000000000ull),
+         .tv_nsec = (long)(remaining_ns % 1000000000ull),
+      };
+      while (nanosleep(&delay, &delay) < 0 && errno == EINTR)
+         ;
+      now_ns = winehua_now_ns();
+   }
+
+   return started_ns && now_ns > started_ns
+      ? (now_ns - started_ns) / 1000ull : 0;
+}
+
+static struct winehua_vtest_present_pacer *
+winehua_get_present_pacer(struct virgl_vtest_winsys *vws, uint32_t surface_id)
+{
+   struct winehua_vtest_present_pacer *empty = NULL;
+
+   for (unsigned i = 0; i < WINEHUA_VTEST_MAX_PRESENT_PACERS; i++) {
+      struct winehua_vtest_present_pacer *pacer =
+         &vws->winehua_present_pacers[i];
+      if (pacer->surface_id == surface_id)
+         return pacer;
+      if (!pacer->surface_id && !empty)
+         empty = pacer;
+   }
+
+   if (!empty)
+      empty = &vws->winehua_present_pacers[
+         surface_id % WINEHUA_VTEST_MAX_PRESENT_PACERS];
+   empty->surface_id = surface_id;
+   empty->next_present_ns = 0;
+   return empty;
 }
 
 static int virgl_vtest_receive_fd(int socket_fd)
@@ -450,6 +503,7 @@ int virgl_vtest_send_winehua_present(struct virgl_vtest_winsys *vws,
                                      uint32_t serial,
                                      uint32_t surface_id)
 {
+   static const uint64_t max_deadline_ahead_ns = 50000000ull;
    uint32_t header[VTEST_HDR_SIZE] = {
       [VTEST_CMD_LEN] = VCMD_WINEHUA_PRESENT_SIZE,
       [VTEST_CMD_ID] = VCMD_WINEHUA_PRESENT,
@@ -471,13 +525,58 @@ int virgl_vtest_send_winehua_present(struct virgl_vtest_winsys *vws,
       [VCMD_WINEHUA_PRESENT_SURFACE_ID] = surface_id,
       [VCMD_WINEHUA_PRESENT_CLIENT_PID] = (uint32_t)getpid(),
    };
-   int ret = virgl_block_write(vws->sock_fd, header, sizeof(header));
+   uint32_t reply_header[VTEST_HDR_SIZE];
+   uint32_t reply[VCMD_WINEHUA_PRESENT_REPLY_SIZE];
+   struct winehua_vtest_present_pacer *pacer =
+      winehua_get_present_pacer(vws, surface_id);
 
-   if (ret < 0)
-      return ret;
+   for (unsigned attempt = 0; attempt < 8; attempt++) {
+      const uint64_t waited_us =
+         winehua_wait_until_ns(pacer->next_present_ns);
+      if (waited_us) {
+         vws->winehua_present_wait_us += waited_us;
+         vws->winehua_present_waits++;
+      }
+      pacer->next_present_ns = 0;
 
-   ret = virgl_block_write(vws->sock_fd, command, sizeof(command));
-   return ret < 0 ? ret : 0;
+      int ret = virgl_block_write(vws->sock_fd, header, sizeof(header));
+      if (ret < 0)
+         return ret;
+      ret = virgl_block_write(vws->sock_fd, command, sizeof(command));
+      if (ret < 0)
+         return ret;
+
+      ret = virgl_block_read(vws->sock_fd, reply_header, sizeof(reply_header));
+      if (ret < 0)
+         return ret;
+      ret = virgl_block_read(vws->sock_fd, reply, sizeof(reply));
+      if (ret < 0)
+         return ret;
+      if (reply_header[VTEST_CMD_LEN] != VCMD_WINEHUA_PRESENT_REPLY_SIZE ||
+          reply_header[VTEST_CMD_ID] != VCMD_WINEHUA_PRESENT ||
+          reply[VCMD_WINEHUA_PRESENT_REPLY_SERIAL] != serial)
+         return -EPROTO;
+
+      const int status =
+         (int32_t)reply[VCMD_WINEHUA_PRESENT_REPLY_STATUS];
+      uint64_t next_deadline_ns =
+         (uint64_t)reply[VCMD_WINEHUA_PRESENT_REPLY_DEADLINE_LO] |
+         (uint64_t)reply[VCMD_WINEHUA_PRESENT_REPLY_DEADLINE_HI] << 32;
+      const uint64_t now_ns = winehua_now_ns();
+      if (next_deadline_ns > now_ns &&
+          next_deadline_ns - now_ns > max_deadline_ahead_ns)
+         next_deadline_ns = now_ns + max_deadline_ahead_ns;
+      pacer->next_present_ns = next_deadline_ns;
+
+      if (status == 0)
+         return 0;
+      if (status < 0)
+         return status;
+      if (status != 1 || !next_deadline_ns)
+         return -EPROTO;
+   }
+
+   return -EAGAIN;
 }
 
 int virgl_vtest_send_resource_unref(struct virgl_vtest_winsys *vws,

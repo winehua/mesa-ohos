@@ -710,10 +710,13 @@ static void virgl_vtest_flush_frontbuffer(struct virgl_winsys *vws,
          fprintf(log_file ? log_file : stderr,
                  "[VTEST-FRONTBUFFER] calls=%d no_dt=%d handle=%u bind=0x%x "
                  "dt=%p format=%u size=%ux%u stride=%u level=%u layer=%u "
-                 "drawable=%p surface=%u present_ret=%d transfer_get_candidate=0\n",
+                 "drawable=%p surface=%u present_ret=%d paced_waits=%llu "
+                 "paced_wait_us=%llu transfer_get_candidate=0\n",
                  call, no_dt, res->res_handle, res->bind, (void *)res->dt,
                  res->format, res->width, res->height, res->stride, level, layer,
-                 winsys_drawable_handle, surface_id, present_ret);
+                 winsys_drawable_handle, surface_id, present_ret,
+                 (unsigned long long)vtws->winehua_present_waits,
+                 (unsigned long long)vtws->winehua_present_wait_us);
          if (log_file)
             fclose(log_file);
       }
@@ -728,11 +731,15 @@ static void virgl_vtest_flush_frontbuffer(struct virgl_winsys *vws,
       fprintf(log_file ? log_file : stderr,
               "[VTEST-FRONTBUFFER] calls=%d no_dt=%d handle=%u bind=0x%x "
               "dt=%p format=%u size=%ux%u stride=%u level=%u layer=%u "
-              "drawable=%p surface=%u present_ret=%d sub_box=%d transfer_get_candidate=1\n",
+              "drawable=%p surface=%u present_ret=%d paced_waits=%llu "
+              "paced_wait_us=%llu sub_box=%d transfer_get_candidate=1\n",
               call, p_atomic_read(&no_displaytarget_count), res->res_handle,
               res->bind, (void *)res->dt, res->format, res->width, res->height,
               res->stride, level, layer, winsys_drawable_handle, surface_id,
-              present_ret, sub_box != NULL);
+              present_ret,
+              (unsigned long long)vtws->winehua_present_waits,
+              (unsigned long long)vtws->winehua_present_wait_us,
+              sub_box != NULL);
       if (log_file)
          fclose(log_file);
    }
