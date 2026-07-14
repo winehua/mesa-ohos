@@ -64,6 +64,8 @@
 #include "util/u_memory.h"
 #include "util/perf/cpu_trace.h"
 
+#include <stdlib.h>
+
 struct hash_table;
 
 struct st_screen
@@ -1200,7 +1202,8 @@ st_manager_flush_frontbuffer(struct st_context *st)
     * flushing.
     */
    if (st->ctx->Visual.doubleBufferMode &&
-       !stfb->Visual.doubleBufferMode)
+       !stfb->Visual.doubleBufferMode &&
+       !getenv("WINEHUA_VTEST_PRESENT"))
       return;
 
    /* Check front buffer used at the GL API level. */

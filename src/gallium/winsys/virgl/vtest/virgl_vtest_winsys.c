@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include "util/macros.h"
 #include "util/u_surface.h"
+#include "util/u_atomic.h"
 #include "util/u_memory.h"
 #include "util/format/u_format.h"
 #include "util/u_inlines.h"
@@ -679,10 +680,64 @@ static void virgl_vtest_flush_frontbuffer(struct virgl_winsys *vws,
                                           void *winsys_drawable_handle,
                                           struct pipe_box *sub_box)
 {
+   static int32_t call_count;
+   static int32_t no_displaytarget_count;
    struct virgl_vtest_winsys *vtws = virgl_vtest_winsys(vws);
    struct pipe_box box;
    uint32_t offset = 0;
-   if (!res->dt)
+   const int32_t call = p_atomic_inc_return(&call_count);
+   const char *present_mode = getenv("WINEHUA_VTEST_PRESENT");
+   uint32_t surface_id = 0;
+   int present_ret = 0;
+
+   if (present_mode) {
+      surface_id = winehua_vtest_get_present_surface_id();
+      if (surface_id)
+         present_ret = virgl_vtest_send_winehua_present(
+            vtws, res->res_handle, level, layer,
+            pipe_to_virgl_format(res->format), res->bind, res->width, res->height,
+            (uintptr_t)winsys_drawable_handle, (uint32_t)call,
+            surface_id);
+   }
+
+   if (!res->dt) {
+      const int32_t no_dt = p_atomic_inc_return(&no_displaytarget_count);
+      if (call == 1 || call % 120 == 0) {
+         FILE *log_file = NULL;
+         const char *log_path = getenv("WINEHUA_VTEST_FRONTBUFFER_LOG");
+         if (log_path && log_path[0])
+            log_file = fopen(log_path, "a");
+         fprintf(log_file ? log_file : stderr,
+                 "[VTEST-FRONTBUFFER] calls=%d no_dt=%d handle=%u bind=0x%x "
+                 "dt=%p format=%u size=%ux%u stride=%u level=%u layer=%u "
+                 "drawable=%p surface=%u present_ret=%d transfer_get_candidate=0\n",
+                 call, no_dt, res->res_handle, res->bind, (void *)res->dt,
+                 res->format, res->width, res->height, res->stride, level, layer,
+                 winsys_drawable_handle, surface_id, present_ret);
+         if (log_file)
+            fclose(log_file);
+      }
+      return;
+   }
+
+   if (call == 1 || call % 120 == 0) {
+      FILE *log_file = NULL;
+      const char *log_path = getenv("WINEHUA_VTEST_FRONTBUFFER_LOG");
+      if (log_path && log_path[0])
+         log_file = fopen(log_path, "a");
+      fprintf(log_file ? log_file : stderr,
+              "[VTEST-FRONTBUFFER] calls=%d no_dt=%d handle=%u bind=0x%x "
+              "dt=%p format=%u size=%ux%u stride=%u level=%u layer=%u "
+              "drawable=%p surface=%u present_ret=%d sub_box=%d transfer_get_candidate=1\n",
+              call, p_atomic_read(&no_displaytarget_count), res->res_handle,
+              res->bind, (void *)res->dt, res->format, res->width, res->height,
+              res->stride, level, layer, winsys_drawable_handle, surface_id,
+              present_ret, sub_box != NULL);
+      if (log_file)
+         fclose(log_file);
+   }
+
+   if (present_mode)
       return;
 
    memset(&box, 0, sizeof(box));

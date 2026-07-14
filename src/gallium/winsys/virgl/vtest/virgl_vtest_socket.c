@@ -23,8 +23,12 @@
 
 #include <sys/socket.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <netinet/in.h>
+#include <sys/mman.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -35,6 +39,47 @@
 
 #include "virgl_vtest_winsys.h"
 #include "virgl_vtest_public.h"
+
+#define WINEHUA_PRESENT_SURFACE_MAGIC 0x57535053u
+#define WINEHUA_PRESENT_SURFACE_VERSION 1u
+
+struct winehua_present_surface_page {
+   uint32_t magic;
+   uint32_t version;
+   uint32_t surface_id;
+   uint32_t reserved;
+};
+
+static pthread_mutex_t winehua_present_surface_mutex = PTHREAD_MUTEX_INITIALIZER;
+static const struct winehua_present_surface_page *winehua_present_surface_page;
+
+static void
+winehua_vtest_map_present_surface_page(void)
+{
+   const char *tmp_dir = getenv("TMPDIR");
+   const struct winehua_present_surface_page *page;
+   char path[256];
+   int fd;
+
+   if (!tmp_dir || !tmp_dir[0] ||
+       snprintf(path, sizeof(path), "%s/winehua_present_surface_%u.shm",
+                tmp_dir, (uint32_t)getpid()) >= sizeof(path))
+      return;
+   fd = open(path, O_RDONLY | O_CLOEXEC);
+   if (fd < 0)
+      return;
+   page = mmap(NULL, sizeof(*page), PROT_READ, MAP_SHARED, fd, 0);
+   close(fd);
+   if (page == MAP_FAILED)
+      return;
+   if (__atomic_load_n(&page->magic, __ATOMIC_ACQUIRE) !=
+          WINEHUA_PRESENT_SURFACE_MAGIC ||
+       page->version != WINEHUA_PRESENT_SURFACE_VERSION) {
+      munmap((void *)page, sizeof(*page));
+      return;
+   }
+   __atomic_store_n(&winehua_present_surface_page, page, __ATOMIC_RELEASE);
+}
 
 /* block read/write routines */
 static int virgl_block_write(int fd, void *buf, int size)
@@ -393,6 +438,48 @@ int virgl_vtest_submit_cmd(struct virgl_vtest_winsys *vws,
    return 0;
 }
 
+int virgl_vtest_send_winehua_present(struct virgl_vtest_winsys *vws,
+                                     uint32_t handle,
+                                     uint32_t level,
+                                     uint32_t layer,
+                                     uint32_t format,
+                                     uint32_t bind,
+                                     uint32_t width,
+                                     uint32_t height,
+                                     uintptr_t drawable,
+                                     uint32_t serial,
+                                     uint32_t surface_id)
+{
+   uint32_t header[VTEST_HDR_SIZE] = {
+      [VTEST_CMD_LEN] = VCMD_WINEHUA_PRESENT_SIZE,
+      [VTEST_CMD_ID] = VCMD_WINEHUA_PRESENT,
+   };
+   uint32_t command[VCMD_WINEHUA_PRESENT_SIZE] = {
+      [VCMD_WINEHUA_PRESENT_PROTOCOL_VERSION] = VCMD_WINEHUA_PRESENT_VERSION,
+      [VCMD_WINEHUA_PRESENT_FLAGS] = 0,
+      [VCMD_WINEHUA_PRESENT_RES_HANDLE] = handle,
+      [VCMD_WINEHUA_PRESENT_LEVEL] = level,
+      [VCMD_WINEHUA_PRESENT_LAYER] = layer,
+      [VCMD_WINEHUA_PRESENT_FORMAT] = format,
+      [VCMD_WINEHUA_PRESENT_BIND] = bind,
+      [VCMD_WINEHUA_PRESENT_WIDTH] = width,
+      [VCMD_WINEHUA_PRESENT_HEIGHT] = height,
+      [VCMD_WINEHUA_PRESENT_DRAWABLE_LO] = (uint32_t)drawable,
+      [VCMD_WINEHUA_PRESENT_DRAWABLE_HI] =
+         (uint32_t)((uint64_t)drawable >> 32),
+      [VCMD_WINEHUA_PRESENT_SERIAL] = serial,
+      [VCMD_WINEHUA_PRESENT_SURFACE_ID] = surface_id,
+      [VCMD_WINEHUA_PRESENT_CLIENT_PID] = (uint32_t)getpid(),
+   };
+   int ret = virgl_block_write(vws->sock_fd, header, sizeof(header));
+
+   if (ret < 0)
+      return ret;
+
+   ret = virgl_block_write(vws->sock_fd, command, sizeof(command));
+   return ret < 0 ? ret : 0;
+}
+
 int virgl_vtest_send_resource_unref(struct virgl_vtest_winsys *vws,
                                     uint32_t handle)
 {
@@ -594,4 +681,20 @@ virgl_vtest_send_create_blob(struct virgl_vtest_winsys *vws,
 
    return res_id;
 }
+uint32_t winehua_vtest_get_present_surface_id(void)
+{
+   const struct winehua_present_surface_page *page =
+      __atomic_load_n(&winehua_present_surface_page, __ATOMIC_ACQUIRE);
 
+   if (!page) {
+      pthread_mutex_lock(&winehua_present_surface_mutex);
+      page = __atomic_load_n(&winehua_present_surface_page, __ATOMIC_RELAXED);
+      if (!page) {
+         winehua_vtest_map_present_surface_page();
+         page = __atomic_load_n(&winehua_present_surface_page,
+                                __ATOMIC_RELAXED);
+      }
+      pthread_mutex_unlock(&winehua_present_surface_mutex);
+   }
+   return page ? __atomic_load_n(&page->surface_id, __ATOMIC_ACQUIRE) : 0;
+}

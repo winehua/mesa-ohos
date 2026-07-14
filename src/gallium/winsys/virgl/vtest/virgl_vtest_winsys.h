@@ -125,6 +125,20 @@ int virgl_vtest_send_resource_unref(struct virgl_vtest_winsys *vws,
 int virgl_vtest_submit_cmd(struct virgl_vtest_winsys *vws,
                            uint32_t *buf, uint32_t buf_len);
 
+int virgl_vtest_send_winehua_present(struct virgl_vtest_winsys *vws,
+                                     uint32_t handle,
+                                     uint32_t level,
+                                     uint32_t layer,
+                                     uint32_t format,
+                                     uint32_t bind,
+                                     uint32_t width,
+                                     uint32_t height,
+                                     uintptr_t drawable,
+                                     uint32_t serial,
+                                     uint32_t surface_id);
+
+uint32_t winehua_vtest_get_present_surface_id(void);
+
 int virgl_vtest_send_transfer_get(struct virgl_vtest_winsys *vws,
                                   uint32_t handle,
                                   uint32_t level, uint32_t stride,
