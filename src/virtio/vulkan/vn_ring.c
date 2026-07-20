@@ -37,6 +37,7 @@ struct vn_ring {
 
    struct vn_ring_shared shared;
    uint32_t cur;
+   bool winehua_strong_publish_barrier;
 
    /* This mutex ensures below:
     * - atomic of ring submission
@@ -99,8 +100,13 @@ vn_ring_store_tail(struct vn_ring *ring)
    /* the renderer is expected to load the tail with memory_order_acquire,
     * forming a release-acquire ordering
     */
-   return atomic_store_explicit(ring->shared.tail, ring->cur,
-                                memory_order_release);
+   /* An x86 release store normally compiles to a plain mov and relies on TSO.
+    * The ring payload may be copied by a native ARM64 memcpy under Box64, so
+    * keep an opt-in full fence to prove whether tail publication can overtake
+    * those shared-memory writes at the cross-architecture boundary. */
+   if (ring->winehua_strong_publish_barrier)
+      atomic_thread_fence(memory_order_seq_cst);
+   atomic_store_explicit(ring->shared.tail, ring->cur, memory_order_release);
 }
 
 uint32_t
@@ -306,6 +312,11 @@ vn_ring_create(struct vn_instance *instance,
    ring->shared.status = shared + layout->status_offset;
    ring->shared.buffer = shared + layout->buffer_offset;
    ring->shared.extra = shared + layout->extra_offset;
+   const char *strong_barrier = os_get_option("VN_WINEHUA_STRONG_RING_BARRIER");
+   ring->winehua_strong_publish_barrier =
+      strong_barrier && strong_barrier[0] == '1';
+   if (ring->winehua_strong_publish_barrier)
+      vn_log(instance, "WineHua strong ring publish barrier enabled");
 
    mtx_init(&ring->mutex, mtx_plain);
 

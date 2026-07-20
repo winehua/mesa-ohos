@@ -22,6 +22,11 @@ struct vn_queue {
    /* wait fence used for vn_QueueWaitIdle */
    VkFence wait_fence;
 
+   /* Absolute Host display deadline returned by WineHua private present.
+    * Vulkan queue operations are externally synchronized, so the next
+    * present on this queue can safely consume and replace this value. */
+   uint64_t winehua_next_present_deadline_ns;
+
    /* semaphore for gluing vkQueueSubmit feedback commands to
     * vkQueueBindSparse
     */

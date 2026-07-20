@@ -1657,9 +1657,11 @@ vn_GetFenceStatus(VkDevice device, VkFence _fence)
 static VkResult
 vn_find_first_signaled_fence(VkDevice device,
                              const VkFence *fences,
-                             uint32_t count)
+                             uint32_t count,
+                             uint32_t *status_call_count)
 {
    for (uint32_t i = 0; i < count; i++) {
+      (*status_call_count)++;
       VkResult result = vn_GetFenceStatus(device, fences[i]);
       if (result == VK_SUCCESS || result < 0)
          return result;
@@ -1668,10 +1670,14 @@ vn_find_first_signaled_fence(VkDevice device,
 }
 
 static VkResult
-vn_remove_signaled_fences(VkDevice device, VkFence *fences, uint32_t *count)
+vn_remove_signaled_fences(VkDevice device,
+                          VkFence *fences,
+                          uint32_t *count,
+                          uint32_t *status_call_count)
 {
    uint32_t cur = 0;
    for (uint32_t i = 0; i < *count; i++) {
+      (*status_call_count)++;
       VkResult result = vn_GetFenceStatus(device, fences[i]);
       if (result != VK_SUCCESS) {
          if (result < 0)
@@ -1715,6 +1721,39 @@ vn_WaitForFences(VkDevice device,
 {
    VN_TRACE_FUNC();
    struct vn_device *dev = vn_device_from_handle(device);
+   static atomic_uint_fast64_t winehua_wait_count;
+   const int64_t wait_start_ns = os_time_get_nano();
+   const uint32_t original_fence_count = fenceCount;
+   uint32_t status_call_count = 0;
+
+   const char *direct_wait = os_get_option("VN_WINEHUA_DIRECT_FENCE_WAIT");
+   bool all_device_only = direct_wait && direct_wait[0] == '1';
+   for (uint32_t i = 0; all_device_only && i < fenceCount; i++) {
+      const struct vn_fence *fence = vn_fence_from_handle(pFences[i]);
+      all_device_only = fence->payload->type == VN_SYNC_TYPE_DEVICE_ONLY;
+   }
+
+   /* The OHOS vtest memory bridge cannot use fence feedback because Host GPU
+    * writes target the Host mapping while Guest reads a separate SHM shadow.
+    * For ordinary device fences, let the renderer perform one real wait
+    * instead of repeatedly polling vkGetFenceStatus across the socket.  Keep
+    * imported sync-fd payloads on the local polling path below. */
+   if (all_device_only && fenceCount) {
+      const VkResult result = vn_call_vkWaitForFences(
+         dev->primary_ring, device, fenceCount, pFences, waitAll, timeout);
+      const uint64_t wait_id =
+         atomic_fetch_add_explicit(&winehua_wait_count, 1,
+                                   memory_order_relaxed) + 1;
+      const int64_t wait_end_ns = os_time_get_nano();
+      if (wait_id <= 8 || !(wait_id % 120) || result != VK_SUCCESS)
+         vn_log(dev->instance,
+                "WineHua fence wait mode=direct count=%" PRIu64
+                " fences=%u wait_all=%u timeout_ns=%" PRIu64
+                " status_calls=0 result=%d elapsed_us=%" PRIi64,
+                wait_id, original_fence_count, waitAll, timeout, result,
+                (wait_end_ns - wait_start_ns) / 1000);
+      return vn_result(dev->instance, result);
+   }
 
    const int64_t abs_timeout = os_time_get_absolute_timeout(timeout);
    VkResult result = VK_NOT_READY;
@@ -1725,7 +1764,8 @@ vn_WaitForFences(VkDevice device,
       struct vn_relax_state relax_state =
          vn_relax_init(dev->instance, VN_RELAX_REASON_FENCE);
       while (result == VK_NOT_READY) {
-         result = vn_remove_signaled_fences(device, fences, &fenceCount);
+         result = vn_remove_signaled_fences(device, fences, &fenceCount,
+                                            &status_call_count);
          result =
             vn_update_sync_result(dev, result, abs_timeout, &relax_state);
       }
@@ -1736,12 +1776,26 @@ vn_WaitForFences(VkDevice device,
       struct vn_relax_state relax_state =
          vn_relax_init(dev->instance, VN_RELAX_REASON_FENCE);
       while (result == VK_NOT_READY) {
-         result = vn_find_first_signaled_fence(device, pFences, fenceCount);
+         result = vn_find_first_signaled_fence(device, pFences, fenceCount,
+                                               &status_call_count);
          result =
             vn_update_sync_result(dev, result, abs_timeout, &relax_state);
       }
       vn_relax_fini(&relax_state);
    }
+
+   const uint64_t wait_id =
+      atomic_fetch_add_explicit(&winehua_wait_count, 1,
+                                memory_order_relaxed) + 1;
+   const int64_t wait_end_ns = os_time_get_nano();
+   if (wait_id <= 8 || !(wait_id % 120) || result != VK_SUCCESS)
+      vn_log(dev->instance,
+             "WineHua fence wait mode=polling count=%" PRIu64
+             " fences=%u wait_all=%u timeout_ns=%" PRIu64
+             " status_calls=%u result=%d elapsed_us=%" PRIi64,
+             wait_id, original_fence_count, waitAll, timeout,
+             status_call_count,
+             result, (wait_end_ns - wait_start_ns) / 1000);
 
    return vn_result(dev->instance, result);
 }

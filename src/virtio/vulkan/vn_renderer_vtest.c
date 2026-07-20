@@ -17,6 +17,7 @@
 
 #include "util/os_file.h"
 #include "util/os_misc.h"
+#include "util/os_time.h"
 #include "util/sparse_array.h"
 #include "util/u_process.h"
 #define VIRGL_RENDERER_UNSTABLE_APIS
@@ -33,6 +34,9 @@
 #define VTEST_PCI_DEVICE_ID 0x1050
 
 struct vtest;
+
+static atomic_uint_fast64_t winehua_present_paced_waits;
+static atomic_uint_fast64_t winehua_present_paced_wait_us;
 
 struct vtest_shmem {
    struct vn_renderer_shmem base;
@@ -74,6 +78,25 @@ struct vtest {
 
    struct vn_renderer_shmem_cache shmem_cache;
 };
+
+static bool
+vtest_winehua_present_trace_enabled(void)
+{
+   const char *value = os_get_option("VN_WINEHUA_PRESENT_TRACE");
+   return value && value[0] == '1';
+}
+
+/* Diagnostic-only mode for the OHOS Host Vulkan shadow bridge.  It keeps the
+ * Host resource alive after the Guest mmap is released so that the 3-second
+ * shmem cache expiry cannot race a Venus ring/stream.  The resource is then
+ * reclaimed with the vtest connection/context; this is intentionally not a
+ * production lifetime policy. */
+static bool
+vtest_winehua_defer_shmem_unref_enabled(void)
+{
+   const char *value = os_get_option("VN_WINEHUA_DEFER_SHMEM_UNREF");
+   return value && value[0] == '1';
+}
 
 static int
 vtest_connect_socket(struct vn_instance *instance, const char *path)
@@ -609,14 +632,22 @@ vtest_vcmd_winehua_vk_present(
    uint32_t reply_header[VTEST_HDR_SIZE];
    uint32_t reply[VCMD_WINEHUA_VK_PRESENT_REPLY_SIZE];
 
-   vn_log(vtest->instance, "winehua vk present: write begin serial=%u queue=%" PRIu64 " image=%" PRIu64,
-          present->serial, present->queue_id, present->image_id);
+   if (vtest_winehua_present_trace_enabled())
+      vn_log(vtest->instance,
+             "winehua vk present: write begin serial=%u queue=%" PRIu64
+             " image=%" PRIu64,
+             present->serial, present->queue_id, present->image_id);
    vtest_write(vtest, header, sizeof(header));
    vtest_write(vtest, command, sizeof(command));
-   vn_log(vtest->instance, "winehua vk present: waiting reply serial=%u", present->serial);
+   if (vtest_winehua_present_trace_enabled())
+      vn_log(vtest->instance, "winehua vk present: waiting reply serial=%u",
+             present->serial);
    vtest_read(vtest, reply_header, sizeof(reply_header));
-   vn_log(vtest->instance, "winehua vk present: reply header serial=%u len=%u id=%u",
-          present->serial, reply_header[VTEST_CMD_LEN], reply_header[VTEST_CMD_ID]);
+   if (vtest_winehua_present_trace_enabled())
+      vn_log(vtest->instance,
+             "winehua vk present: reply header serial=%u len=%u id=%u",
+             present->serial, reply_header[VTEST_CMD_LEN],
+             reply_header[VTEST_CMD_ID]);
    if (reply_header[VTEST_CMD_ID] != VCMD_WINEHUA_VK_PRESENT ||
        reply_header[VTEST_CMD_LEN] != VCMD_WINEHUA_VK_PRESENT_REPLY_SIZE)
       return -EPROTO;
@@ -631,8 +662,10 @@ vtest_vcmd_winehua_vk_present(
          (uint64_t)reply[VCMD_WINEHUA_VK_PRESENT_REPLY_DEADLINE_HI] << 32;
    }
 
-   vn_log(vtest->instance, "winehua vk present: reply status=%d serial=%u",
-          (int32_t)reply[VCMD_WINEHUA_VK_PRESENT_REPLY_STATUS], present->serial);
+   if (vtest_winehua_present_trace_enabled())
+      vn_log(vtest->instance, "winehua vk present: reply status=%d serial=%u",
+             (int32_t)reply[VCMD_WINEHUA_VK_PRESENT_REPLY_STATUS],
+             present->serial);
    return (int32_t)reply[VCMD_WINEHUA_VK_PRESENT_REPLY_STATUS];
 }
 
@@ -843,8 +876,19 @@ vtest_shmem_destroy_now(struct vn_renderer *renderer,
 {
    struct vtest *vtest = (struct vtest *)renderer;
    struct vtest_shmem *shmem = (struct vtest_shmem *)_shmem;
+   static atomic_uint_fast64_t deferred_unref_count;
 
    munmap(shmem->base.mmap_ptr, shmem->base.mmap_size);
+
+   if (vtest_winehua_defer_shmem_unref_enabled()) {
+      const uint64_t count = atomic_fetch_add_explicit(
+         &deferred_unref_count, 1, memory_order_relaxed) + 1;
+      if (count <= 8 || !(count % 120))
+         vn_log(vtest->instance,
+                "WineHua shmem unref deferred res=%u size=%zu count=%" PRIu64,
+                shmem->base.res_id, shmem->base.mmap_size, count);
+      return;
+   }
 
    mtx_lock(&vtest->sock_mutex);
    vtest_vcmd_resource_unref(vtest, shmem->base.res_id);
@@ -988,12 +1032,16 @@ vtest_winehua_present(
 {
    struct vtest *vtest = (struct vtest *)renderer;
 
-   vn_log(vtest->instance, "winehua vk present: lock socket serial=%u", present->serial);
+   if (vtest_winehua_present_trace_enabled())
+      vn_log(vtest->instance, "winehua vk present: lock socket serial=%u",
+             present->serial);
    mtx_lock(&vtest->sock_mutex);
    const int result = vtest_vcmd_winehua_vk_present(vtest, present);
    mtx_unlock(&vtest->sock_mutex);
-   vn_log(vtest->instance, "winehua vk present: unlock socket serial=%u result=%d",
-          present->serial, result);
+   if (vtest_winehua_present_trace_enabled())
+      vn_log(vtest->instance,
+             "winehua vk present: unlock socket serial=%u result=%d",
+             present->serial, result);
 
    return result;
 }
@@ -1207,6 +1255,37 @@ vn_winehua_present(VkQueue queue_handle,
       return -EINVAL;
 
    struct vn_device *dev = (void *)queue->base.base.base.device;
+   const uint64_t pacing_deadline_ns =
+      queue->winehua_next_present_deadline_ns;
+   queue->winehua_next_present_deadline_ns = 0;
+
+   /* Wait for the previous Host-provided deadline only after the application
+    * has rendered its next frame and entered present.  This overlaps game
+    * rendering with the display period instead of serializing render time
+    * after an immediate post-present sleep. */
+   const int64_t pacing_now_ns = os_time_get_nano();
+   if (pacing_now_ns > 0 && pacing_deadline_ns > (uint64_t)pacing_now_ns) {
+      const uint64_t remaining_ns =
+         pacing_deadline_ns - (uint64_t)pacing_now_ns;
+      if (remaining_ns <= 100000000ull) {
+         const int64_t wait_start_ns = os_time_get_nano();
+         os_time_sleep((int64_t)((remaining_ns + 999ull) / 1000ull));
+         const int64_t wait_end_ns = os_time_get_nano();
+         const uint64_t waited_us = wait_end_ns > wait_start_ns
+            ? (uint64_t)(wait_end_ns - wait_start_ns) / 1000ull : 0;
+         const uint64_t wait_count = atomic_fetch_add_explicit(
+            &winehua_present_paced_waits, 1, memory_order_relaxed) + 1;
+         const uint64_t total_us = atomic_fetch_add_explicit(
+            &winehua_present_paced_wait_us, waited_us,
+            memory_order_relaxed) + waited_us;
+         if (wait_count <= 8 || !(wait_count % 120))
+            vn_log(dev->instance,
+                   "winehua vk present: paced_waits=%" PRIu64
+                   " last_us=%" PRIu64 " total_us=%" PRIu64,
+                   wait_count, waited_us, total_us);
+      }
+   }
+
    const struct vn_renderer_winehua_present present = {
       .queue_id = queue->base.id,
       .image_id = image->base.id,
@@ -1241,6 +1320,9 @@ vn_winehua_present(VkQueue queue_handle,
          usleep(1000u << attempt);
       }
    }
+
+   if ((result == 0 || result == 1) && next_present_deadline_ns)
+      queue->winehua_next_present_deadline_ns = *next_present_deadline_ns;
 
    return result;
 }
