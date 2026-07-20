@@ -1712,10 +1712,10 @@ foreach d : _libdrm_checks
 endforeach
 
 with_gallium_drisw_kms = false
-if system_has_kms_drm
+if system_has_kms_drm or with_virtio_vk
   dep_libdrm = dependency(
     'libdrm', version : '>=' + _drm_ver,
-    required : with_dri2 or with_dri or with_gbm
+    required : with_dri2 or with_dri or with_gbm or with_virtio_vk
   )
 else
   # We should prevent libdrm from being available when the target doesn't have it to avoid transitive

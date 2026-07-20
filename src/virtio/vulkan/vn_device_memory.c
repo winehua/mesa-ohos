@@ -10,6 +10,8 @@
 
 #include "vn_device_memory.h"
 
+#include "util/os_misc.h"
+
 #include "venus-protocol/vn_protocol_driver_device_memory.h"
 #include "venus-protocol/vn_protocol_driver_transport.h"
 
@@ -512,6 +514,15 @@ vn_FlushMappedMemoryRanges(VkDevice device,
       vn_renderer_bo_flush(dev->renderer, mem->base_bo, range->offset, size);
    }
 
+   /* WineHua's vtest transport maps an OHOS shadow file rather than the Host
+    * VkDeviceMemory itself.  Its local bo flush is therefore insufficient:
+    * publish the ranges through the existing Venus protocol so the renderer
+    * can update the Host mapping before queue submission or fence refresh. */
+   const char *remote_sync = os_get_option("VN_WINEHUA_REMOTE_MEMORY_SYNC");
+   if (remote_sync && remote_sync[0] == '1')
+      return vn_call_vkFlushMappedMemoryRanges(dev->primary_ring, device,
+                                               memoryRangeCount, pMemoryRanges);
+
    return VK_SUCCESS;
 }
 
@@ -533,6 +544,12 @@ vn_InvalidateMappedMemoryRanges(VkDevice device,
       vn_renderer_bo_invalidate(dev->renderer, mem->base_bo, range->offset,
                                 size);
    }
+
+   const char *remote_sync = os_get_option("VN_WINEHUA_REMOTE_MEMORY_SYNC");
+   if (remote_sync && remote_sync[0] == '1')
+      return vn_call_vkInvalidateMappedMemoryRanges(dev->primary_ring, device,
+                                                    memoryRangeCount,
+                                                    pMemoryRanges);
 
    return VK_SUCCESS;
 }

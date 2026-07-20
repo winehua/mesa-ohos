@@ -24,6 +24,10 @@
 #include "vtest/vtest_protocol.h"
 
 #include "vn_renderer_internal.h"
+#include "vn_device.h"
+#include "vn_image.h"
+#include "vn_queue.h"
+#include "vn_ring.h"
 
 #define VTEST_PCI_VENDOR_ID 0x1af4
 #define VTEST_PCI_DEVICE_ID 0x1050
@@ -575,6 +579,63 @@ vtest_vcmd_submit_cmd2(struct vtest *vtest,
    }
 }
 
+static int
+vtest_vcmd_winehua_vk_present(
+   struct vtest *vtest,
+   const struct vn_renderer_winehua_present *present)
+{
+   const uint32_t header[VTEST_HDR_SIZE] = {
+      [VTEST_CMD_LEN] = VCMD_WINEHUA_VK_PRESENT_SIZE,
+      [VTEST_CMD_ID] = VCMD_WINEHUA_VK_PRESENT,
+   };
+   const uint32_t command[VCMD_WINEHUA_VK_PRESENT_SIZE] = {
+      [VCMD_WINEHUA_VK_PRESENT_PROTOCOL_VERSION] =
+         VCMD_WINEHUA_VK_PRESENT_VERSION,
+      [VCMD_WINEHUA_VK_PRESENT_FLAGS] = present->flags,
+      [VCMD_WINEHUA_VK_PRESENT_QUEUE_ID_LO] = (uint32_t)present->queue_id,
+      [VCMD_WINEHUA_VK_PRESENT_QUEUE_ID_HI] =
+         (uint32_t)(present->queue_id >> 32),
+      [VCMD_WINEHUA_VK_PRESENT_IMAGE_ID_LO] = (uint32_t)present->image_id,
+      [VCMD_WINEHUA_VK_PRESENT_IMAGE_ID_HI] =
+         (uint32_t)(present->image_id >> 32),
+      [VCMD_WINEHUA_VK_PRESENT_WIDTH] = present->width,
+      [VCMD_WINEHUA_VK_PRESENT_HEIGHT] = present->height,
+      [VCMD_WINEHUA_VK_PRESENT_FORMAT] = present->format,
+      [VCMD_WINEHUA_VK_PRESENT_LAYOUT] = present->layout,
+      [VCMD_WINEHUA_VK_PRESENT_SERIAL] = present->serial,
+      [VCMD_WINEHUA_VK_PRESENT_SURFACE_ID] = present->surface_id,
+      [VCMD_WINEHUA_VK_PRESENT_CLIENT_PID] = present->client_pid,
+   };
+   uint32_t reply_header[VTEST_HDR_SIZE];
+   uint32_t reply[VCMD_WINEHUA_VK_PRESENT_REPLY_SIZE];
+
+   vn_log(vtest->instance, "winehua vk present: write begin serial=%u queue=%" PRIu64 " image=%" PRIu64,
+          present->serial, present->queue_id, present->image_id);
+   vtest_write(vtest, header, sizeof(header));
+   vtest_write(vtest, command, sizeof(command));
+   vn_log(vtest->instance, "winehua vk present: waiting reply serial=%u", present->serial);
+   vtest_read(vtest, reply_header, sizeof(reply_header));
+   vn_log(vtest->instance, "winehua vk present: reply header serial=%u len=%u id=%u",
+          present->serial, reply_header[VTEST_CMD_LEN], reply_header[VTEST_CMD_ID]);
+   if (reply_header[VTEST_CMD_ID] != VCMD_WINEHUA_VK_PRESENT ||
+       reply_header[VTEST_CMD_LEN] != VCMD_WINEHUA_VK_PRESENT_REPLY_SIZE)
+      return -EPROTO;
+
+   vtest_read(vtest, reply, sizeof(reply));
+   if (reply[VCMD_WINEHUA_VK_PRESENT_REPLY_SERIAL] != present->serial)
+      return -EPROTO;
+
+   if (present->next_present_deadline_ns) {
+      *present->next_present_deadline_ns =
+         (uint64_t)reply[VCMD_WINEHUA_VK_PRESENT_REPLY_DEADLINE_LO] |
+         (uint64_t)reply[VCMD_WINEHUA_VK_PRESENT_REPLY_DEADLINE_HI] << 32;
+   }
+
+   vn_log(vtest->instance, "winehua vk present: reply status=%d serial=%u",
+          (int32_t)reply[VCMD_WINEHUA_VK_PRESENT_REPLY_STATUS], present->serial);
+   return (int32_t)reply[VCMD_WINEHUA_VK_PRESENT_REPLY_STATUS];
+}
+
 static VkResult
 vtest_sync_write(struct vn_renderer *renderer,
                  struct vn_renderer_sync *_sync,
@@ -920,6 +981,23 @@ vtest_submit(struct vn_renderer *renderer,
    return VK_SUCCESS;
 }
 
+static int
+vtest_winehua_present(
+   struct vn_renderer *renderer,
+   const struct vn_renderer_winehua_present *present)
+{
+   struct vtest *vtest = (struct vtest *)renderer;
+
+   vn_log(vtest->instance, "winehua vk present: lock socket serial=%u", present->serial);
+   mtx_lock(&vtest->sock_mutex);
+   const int result = vtest_vcmd_winehua_vk_present(vtest, present);
+   mtx_unlock(&vtest->sock_mutex);
+   vn_log(vtest->instance, "winehua vk present: unlock socket serial=%u result=%d",
+          present->serial, result);
+
+   return result;
+}
+
 static void
 vtest_init_renderer_info(struct vtest *vtest)
 {
@@ -1062,6 +1140,7 @@ vtest_init(struct vtest *vtest)
    vtest->base.ops.destroy = vtest_destroy;
    vtest->base.ops.submit = vtest_submit;
    vtest->base.ops.wait = vtest_wait;
+   vtest->base.ops.winehua_present = vtest_winehua_present;
 
    vtest->base.shmem_ops.create = vtest_shmem_create;
    vtest->base.shmem_ops.destroy = vtest_shmem_destroy;
@@ -1108,4 +1187,60 @@ vn_renderer_create_vtest(struct vn_instance *instance,
    *renderer = &vtest->base;
 
    return VK_SUCCESS;
+}
+
+__attribute__((visibility("default"))) int
+vn_winehua_present(VkQueue queue_handle,
+                   VkImage image_handle,
+                   uint32_t width,
+                   uint32_t height,
+                   VkFormat format,
+                   VkImageLayout layout,
+                   uint32_t client_pid,
+                   uint32_t surface_id,
+                   uint32_t serial,
+                   uint64_t *next_present_deadline_ns)
+{
+   struct vn_queue *queue = vn_queue_from_handle(queue_handle);
+   struct vn_image *image = vn_image_from_handle(image_handle);
+   if (!queue || !image || !width || !height || !client_pid || !surface_id)
+      return -EINVAL;
+
+   struct vn_device *dev = (void *)queue->base.base.base.device;
+   const struct vn_renderer_winehua_present present = {
+      .queue_id = queue->base.id,
+      .image_id = image->base.id,
+      .width = width,
+      .height = height,
+      .format = format,
+      .layout = layout,
+      .client_pid = client_pid,
+      .surface_id = surface_id,
+      .serial = serial,
+      .next_present_deadline_ns = next_present_deadline_ns,
+   };
+
+   /* The private present request uses the vtest socket while Vulkan object
+    * creation and queue submission travel through the Venus ring.  Complete
+    * a renderer roundtrip so the host object table and VkQueue have observed
+    * all earlier commands before the out-of-band present lookup.  A renderer
+    * worker can still publish the queue/image entry just after that roundtrip
+    * returns, so treat -EAGAIN as a bounded publication race and retry here.
+    * Never expose that transient errno to Wine: the Vulkan thunk maps a
+    * negative result to DEVICE_LOST, poisoning an otherwise valid x86 process.
+    * This is not a GPU idle wait; execution remains ordered by the same host
+    * queue. */
+   int result = -EAGAIN;
+   for (unsigned attempt = 0; attempt < 8 && result == -EAGAIN; attempt++) {
+      vn_ring_roundtrip(dev->primary_ring);
+      result = vn_renderer_winehua_present(dev->renderer, &present);
+      if (result == -EAGAIN) {
+         vn_log(dev->instance,
+                "winehua vk present: object publication pending serial=%u attempt=%u",
+                serial, attempt + 1);
+         usleep(1000u << attempt);
+      }
+   }
+
+   return result;
 }

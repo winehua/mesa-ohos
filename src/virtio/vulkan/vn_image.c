@@ -10,6 +10,8 @@
 
 #include "vn_image.h"
 
+#include "util/os_misc.h"
+
 #include "venus-protocol/vn_protocol_driver_image.h"
 #include "venus-protocol/vn_protocol_driver_image_view.h"
 #include "venus-protocol/vn_protocol_driver_sampler.h"
@@ -23,6 +25,17 @@
 #include "vn_wsi.h"
 
 #define IMAGE_REQS_CACHE_MAX_ENTRIES 500
+
+static bool
+vn_winehua_sample_trace_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0) {
+      const char *value = os_get_option("DXVK_WINEHUA_TRACE_SAMPLED");
+      enabled = value && value[0] == '1';
+   }
+   return enabled != 0;
+}
 
 /* image commands */
 
@@ -704,6 +717,17 @@ vn_CreateImage(VkDevice device,
       return vn_error(dev->instance, result);
 
    *pImage = vn_image_to_handle(img);
+   if (vn_winehua_sample_trace_enabled()) {
+      vn_log(NULL,
+             "WineHuaSampled: guest-image guestId=%" PRIu64
+             " guestHandle=0x%" PRIxPTR " format=%u extent=%ux%ux%u"
+             " mips=%u layers=%u usage=0x%x tiling=%u",
+             img->base.id, (uintptr_t)*pImage, pCreateInfo->format,
+             pCreateInfo->extent.width, pCreateInfo->extent.height,
+             pCreateInfo->extent.depth, pCreateInfo->mipLevels,
+             pCreateInfo->arrayLayers, pCreateInfo->usage,
+             pCreateInfo->tiling);
+   }
    return VK_SUCCESS;
 }
 
@@ -938,6 +962,21 @@ vn_CreateImageView(VkDevice device,
                               &view_handle);
 
    *pView = view_handle;
+
+   if (vn_winehua_sample_trace_enabled()) {
+      vn_log(NULL,
+             "WineHuaSampled: guest-image-view guestViewId=%" PRIu64
+             " guestView=0x%" PRIxPTR " guestImageId=%" PRIu64
+             " guestImage=0x%" PRIxPTR " format=%u aspect=0x%x"
+             " baseMip=%u mipCount=%u baseLayer=%u layerCount=%u",
+             view->base.id, (uintptr_t)view_handle,
+             img->base.id, (uintptr_t)pCreateInfo->image,
+             pCreateInfo->format, pCreateInfo->subresourceRange.aspectMask,
+             pCreateInfo->subresourceRange.baseMipLevel,
+             pCreateInfo->subresourceRange.levelCount,
+             pCreateInfo->subresourceRange.baseArrayLayer,
+             pCreateInfo->subresourceRange.layerCount);
+   }
 
    return VK_SUCCESS;
 }

@@ -10,6 +10,8 @@
 
 #include "vn_descriptor_set.h"
 
+#include "util/os_misc.h"
+
 #include "venus-protocol/vn_protocol_driver_descriptor_pool.h"
 #include "venus-protocol/vn_protocol_driver_descriptor_set.h"
 #include "venus-protocol/vn_protocol_driver_descriptor_set_layout.h"
@@ -17,6 +19,61 @@
 
 #include "vn_device.h"
 #include "vn_pipeline.h"
+
+static bool
+vn_winehua_sample_trace_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0) {
+      const char *value = os_get_option("DXVK_WINEHUA_TRACE_SAMPLED");
+      enabled = value && value[0] == '1';
+   }
+   return enabled != 0;
+}
+
+static bool
+vn_winehua_image_descriptor(VkDescriptorType type)
+{
+   switch (type) {
+   case VK_DESCRIPTOR_TYPE_SAMPLER:
+   case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+   case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+   case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static void
+vn_winehua_log_descriptor_writes(const char *phase,
+                                  uint32_t write_count,
+                                  const VkWriteDescriptorSet *writes)
+{
+   if (!vn_winehua_sample_trace_enabled())
+      return;
+
+   for (uint32_t i = 0; i < write_count; i++) {
+      const VkWriteDescriptorSet *write = &writes[i];
+      if (!vn_winehua_image_descriptor(write->descriptorType) ||
+          !write->pImageInfo)
+         continue;
+
+      for (uint32_t j = 0; j < write->descriptorCount; j++) {
+         const VkDescriptorImageInfo *info = &write->pImageInfo[j];
+         vn_log(NULL,
+                "WineHuaSampled: guest-descriptor phase=%s write=%u "
+                "set=0x%" PRIxPTR " binding=%u arrayElement=%u "
+                "type=%u imageView=0x%" PRIxPTR " sampler=0x%" PRIxPTR " "
+                "layout=%u",
+                phase, i, (uintptr_t)write->dstSet, write->dstBinding,
+                write->dstArrayElement + j, write->descriptorType,
+                (uintptr_t)info->imageView, (uintptr_t)info->sampler,
+                info->imageLayout);
+      }
+   }
+}
 
 void
 vn_descriptor_set_layout_destroy(struct vn_device *dev,
@@ -826,6 +883,9 @@ vn_UpdateDescriptorSets(VkDevice device,
                         const VkCopyDescriptorSet *pDescriptorCopies)
 {
    struct vn_device *dev = vn_device_from_handle(device);
+   vn_winehua_log_descriptor_writes("vkUpdateDescriptorSets-input",
+                                    descriptorWriteCount,
+                                    pDescriptorWrites);
    const uint32_t img_info_count = vn_descriptor_set_count_write_images(
       descriptorWriteCount, pDescriptorWrites);
 
@@ -837,6 +897,10 @@ vn_UpdateDescriptorSets(VkDevice device,
    };
    pDescriptorWrites = vn_descriptor_set_get_writes(
       descriptorWriteCount, pDescriptorWrites, VK_NULL_HANDLE, &local);
+
+   vn_winehua_log_descriptor_writes("vkUpdateDescriptorSets-encoded",
+                                    descriptorWriteCount,
+                                    pDescriptorWrites);
 
    vn_async_vkUpdateDescriptorSets(dev->primary_ring, device,
                                    descriptorWriteCount, pDescriptorWrites,
@@ -1075,6 +1139,10 @@ vn_UpdateDescriptorSetWithTemplate(
    };
    vn_descriptor_set_fill_update_with_template(templ, descriptorSet, pData,
                                                &update);
+
+   vn_winehua_log_descriptor_writes("template-expanded",
+                                    update.write_count,
+                                    update.writes);
 
    vn_async_vkUpdateDescriptorSets(
       dev->primary_ring, device, update.write_count, update.writes, 0, NULL);

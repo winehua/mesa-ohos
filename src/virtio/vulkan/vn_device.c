@@ -18,6 +18,7 @@
 #include "vn_instance.h"
 #include "vn_physical_device.h"
 #include "vn_queue.h"
+#include "vn_renderer.h"
 
 /* device commands */
 
@@ -625,6 +626,13 @@ PFN_vkVoidFunction
 vn_GetDeviceProcAddr(VkDevice device, const char *pName)
 {
    struct vn_device *dev = vn_device_from_handle(device);
+
+   /* WineHua's private present bridge is intentionally not a Vulkan API
+    * entrypoint, but exposing it through the already-loaded ICD keeps the
+    * caller from dlopen'ing this library again while a Vulkan call is active. */
+   if (pName && !strcmp(pName, "vn_winehua_present"))
+      return (PFN_vkVoidFunction)vn_winehua_present;
+
    return vk_device_get_proc_addr(&dev->base.base, pName);
 }
 

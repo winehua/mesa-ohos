@@ -6,6 +6,8 @@
 #ifndef VN_RENDERER_H
 #define VN_RENDERER_H
 
+#include <errno.h>
+
 #include "vn_common.h"
 
 struct vn_renderer_shmem {
@@ -117,6 +119,20 @@ struct vn_renderer_wait {
    uint32_t sync_count;
 };
 
+struct vn_renderer_winehua_present {
+   vn_object_id queue_id;
+   vn_object_id image_id;
+   uint32_t width;
+   uint32_t height;
+   VkFormat format;
+   VkImageLayout layout;
+   uint32_t client_pid;
+   uint32_t surface_id;
+   uint32_t serial;
+   uint32_t flags;
+   uint64_t *next_present_deadline_ns;
+};
+
 struct vn_renderer_ops {
    void (*destroy)(struct vn_renderer *renderer,
                    const VkAllocationCallbacks *alloc);
@@ -130,6 +146,10 @@ struct vn_renderer_ops {
     */
    VkResult (*wait)(struct vn_renderer *renderer,
                     const struct vn_renderer_wait *wait);
+
+   int (*winehua_present)(
+      struct vn_renderer *renderer,
+      const struct vn_renderer_winehua_present *present);
 };
 
 struct vn_renderer_shmem_ops {
@@ -228,6 +248,18 @@ vn_renderer_create_vtest(struct vn_instance *instance,
                          const VkAllocationCallbacks *alloc,
                          struct vn_renderer **renderer);
 
+__attribute__((visibility("default"))) int
+vn_winehua_present(VkQueue queue_handle,
+                   VkImage image_handle,
+                   uint32_t width,
+                   uint32_t height,
+                   VkFormat format,
+                   VkImageLayout layout,
+                   uint32_t client_pid,
+                   uint32_t surface_id,
+                   uint32_t serial,
+                   uint64_t *next_present_deadline_ns);
+
 static inline VkResult
 vn_renderer_create(struct vn_instance *instance,
                    const VkAllocationCallbacks *alloc,
@@ -261,6 +293,16 @@ vn_renderer_wait(struct vn_renderer *renderer,
                  const struct vn_renderer_wait *wait)
 {
    return renderer->ops.wait(renderer, wait);
+}
+
+static inline int
+vn_renderer_winehua_present(
+   struct vn_renderer *renderer,
+   const struct vn_renderer_winehua_present *present)
+{
+   return renderer->ops.winehua_present
+             ? renderer->ops.winehua_present(renderer, present)
+             : -ENOSYS;
 }
 
 static inline struct vn_renderer_shmem *
