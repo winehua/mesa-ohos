@@ -43,6 +43,19 @@ vn_winehua_event_fence_wait_enabled(void)
    return enabled != 0;
 }
 
+static bool
+vn_winehua_frame_assoc_trace_enabled(void)
+{
+   static atomic_int cached = ATOMIC_VAR_INIT(-1);
+   int enabled = atomic_load_explicit(&cached, memory_order_relaxed);
+   if (enabled < 0) {
+      const char *value = os_get_option("WINEHUA_DXVK_TRACE_CAMERA");
+      enabled = value && value[0] == '1' && !value[1];
+      atomic_store_explicit(&cached, enabled, memory_order_relaxed);
+   }
+   return enabled != 0;
+}
+
 struct vn_submit_info_pnext_fix {
    VkDeviceGroupSubmitInfo group;
    VkProtectedSubmitInfo protected;
@@ -1048,6 +1061,27 @@ vn_queue_submit(struct vn_queue_submission *submit)
    struct vn_device *dev = (void *)queue->base.base.base.device;
    struct vn_instance *instance = dev->instance;
    VkResult result;
+
+   if (vn_winehua_frame_assoc_trace_enabled()) {
+      for (uint32_t batch_index = 0; batch_index < submit->batch_count;
+           batch_index++) {
+         if (submit->batch_type == VK_STRUCTURE_TYPE_BIND_SPARSE_INFO)
+            break;
+
+         const uint32_t cmd_count = vn_get_cmd_count(submit, batch_index);
+         for (uint32_t cmd_index = 0; cmd_index < cmd_count; cmd_index++) {
+            struct vn_command_buffer *cmd =
+               vn_get_cmd(submit, batch_index, cmd_index);
+            const VkCommandBuffer cmd_handle =
+               vn_command_buffer_to_handle(cmd);
+            fprintf(stderr,
+                    "WineHuaGuestFrameAssoc: queue-submit guestCmd=0x%" PRIxPTR
+                    " cmdId=%" PRIu64 " batch=%u cmdIndex=%u\n",
+                    (uintptr_t)cmd_handle, cmd->base.id, batch_index,
+                    cmd_index);
+         }
+      }
+   }
 
    /* To ensure external components waiting on the correct fence payload,
     * below sync primitives must be installed after the submission:
