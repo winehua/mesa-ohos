@@ -28,6 +28,8 @@
 #include "vn_ring.h"
 #include "vn_wsi.h"
 
+#include <unistd.h>
+
 /* queue commands */
 
 static bool
@@ -1075,9 +1077,9 @@ vn_queue_submit(struct vn_queue_submission *submit)
             const VkCommandBuffer cmd_handle =
                vn_command_buffer_to_handle(cmd);
             fprintf(stderr,
-                    "WineHuaGuestFrameAssoc: queue-submit guestCmd=0x%" PRIxPTR
+                    "WineHuaGuestFrameAssoc: unixPid=%d queue-submit guestCmd=0x%" PRIxPTR
                     " cmdId=%" PRIu64 " batch=%u cmdIndex=%u\n",
-                    (uintptr_t)cmd_handle, cmd->base.id, batch_index,
+                    getpid(), (uintptr_t)cmd_handle, cmd->base.id, batch_index,
                     cmd_index);
          }
       }
