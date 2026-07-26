@@ -25,9 +25,23 @@
 #include "vn_physical_device.h"
 #include "vn_query_pool.h"
 #include "vn_renderer.h"
+#include "vn_ring.h"
 #include "vn_wsi.h"
 
 /* queue commands */
+
+static bool
+vn_winehua_event_fence_wait_enabled(void)
+{
+   static atomic_int cached = ATOMIC_VAR_INIT(-1);
+   int enabled = atomic_load_explicit(&cached, memory_order_relaxed);
+   if (enabled < 0) {
+      const char *value = os_get_option("VN_WINEHUA_EVENT_FENCE_WAIT");
+      enabled = value && value[0] == '1' && !value[1];
+      atomic_store_explicit(&cached, enabled, memory_order_relaxed);
+   }
+   return enabled != 0;
+}
 
 struct vn_submit_info_pnext_fix {
    VkDeviceGroupSubmitInfo group;
@@ -1095,9 +1109,15 @@ vn_queue_submit(struct vn_queue_submission *submit)
     * because an fd is already available.
     */
    struct vn_fence *fence = vn_fence_from_handle(submit->fence_handle);
-   if (fence && fence->is_external) {
+   if (fence && fence->is_external)
       assert(fence->payload->type == VN_SYNC_TYPE_DEVICE_ONLY);
+   if (fence && fence->payload->type == VN_SYNC_TYPE_DEVICE_ONLY &&
+       (fence->is_external || vn_winehua_event_fence_wait_enabled())) {
+      simple_mtx_lock(&fence->winehua_event_mutex);
       fence->external_payload = submit->external_payload;
+      fence->external_payload.submission_valid = true;
+      fence->winehua_event_submitted = false;
+      simple_mtx_unlock(&fence->winehua_event_mutex);
    }
 
    for (uint32_t i = 0; i < submit->batch_count; i++) {
@@ -1534,6 +1554,7 @@ vn_CreateFence(VkDevice device,
       return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    vn_object_base_init(&fence->base, VK_OBJECT_TYPE_FENCE, &dev->base);
+   simple_mtx_init(&fence->winehua_event_mutex, mtx_plain);
 
    const struct VkExportFenceCreateInfo *export_info =
       vk_find_struct_const(pCreateInfo->pNext, EXPORT_FENCE_CREATE_INFO);
@@ -1558,6 +1579,7 @@ out_payloads_fini:
    vn_sync_payload_release(dev, &fence->temporary);
 
 out_object_base_fini:
+   simple_mtx_destroy(&fence->winehua_event_mutex);
    vn_object_base_fini(&fence->base);
    vk_free(alloc, fence);
    return vn_error(dev->instance, result);
@@ -1579,11 +1601,15 @@ vn_DestroyFence(VkDevice device,
 
    vn_async_vkDestroyFence(dev->primary_ring, device, _fence, NULL);
 
+   if (fence->winehua_event_sync)
+      vn_renderer_sync_destroy(dev->renderer, fence->winehua_event_sync);
+
    vn_fence_feedback_fini(dev, fence, alloc);
 
    vn_sync_payload_release(dev, &fence->permanent);
    vn_sync_payload_release(dev, &fence->temporary);
 
+   simple_mtx_destroy(&fence->winehua_event_mutex);
    vn_object_base_fini(&fence->base);
    vk_free(alloc, fence);
 }
@@ -1604,6 +1630,12 @@ vn_ResetFences(VkDevice device, uint32_t fenceCount, const VkFence *pFences)
 
       assert(perm->type == VN_SYNC_TYPE_DEVICE_ONLY);
       fence->payload = perm;
+
+      simple_mtx_lock(&fence->winehua_event_mutex);
+      fence->external_payload.submission_valid = false;
+      fence->external_payload.ring_seqno_valid = false;
+      fence->winehua_event_submitted = false;
+      simple_mtx_unlock(&fence->winehua_event_mutex);
 
       if (fence->feedback.slot)
          vn_feedback_reset_status(fence->feedback.slot);
@@ -1712,6 +1744,249 @@ vn_update_sync_result(struct vn_device *dev,
    return result;
 }
 
+static atomic_uint_fast64_t winehua_fence_wait_count;
+static atomic_uint_fast64_t winehua_fence_wait_total_us;
+static atomic_uint_fast64_t winehua_fence_wait_max_us;
+static atomic_uint_fast64_t winehua_fence_status_call_count;
+static atomic_uint_fast64_t winehua_fence_direct_wait_count;
+static atomic_uint_fast64_t winehua_fence_event_wait_count;
+static atomic_uint_fast64_t winehua_fence_timeout_count;
+static atomic_uint_fast64_t winehua_fence_error_count;
+
+static void
+vn_winehua_perf_atomic_max(atomic_uint_fast64_t *value, uint64_t candidate)
+{
+   uint_fast64_t current = atomic_load_explicit(value, memory_order_relaxed);
+   while (current < candidate &&
+          !atomic_compare_exchange_weak_explicit(value, &current, candidate,
+                                                 memory_order_relaxed,
+                                                 memory_order_relaxed))
+      ;
+}
+
+static void
+vn_winehua_record_fence_wait(struct vn_device *dev,
+                             bool direct,
+                             bool event,
+                             uint32_t status_calls,
+                             VkResult result,
+                             uint64_t elapsed_us)
+{
+   const uint64_t wait_count = atomic_fetch_add_explicit(
+      &winehua_fence_wait_count, 1, memory_order_relaxed) + 1;
+   atomic_fetch_add_explicit(&winehua_fence_wait_total_us, elapsed_us,
+                             memory_order_relaxed);
+   atomic_fetch_add_explicit(&winehua_fence_status_call_count, status_calls,
+                             memory_order_relaxed);
+   vn_winehua_perf_atomic_max(&winehua_fence_wait_max_us, elapsed_us);
+   if (direct)
+      atomic_fetch_add_explicit(&winehua_fence_direct_wait_count, 1,
+                                memory_order_relaxed);
+   if (event)
+      atomic_fetch_add_explicit(&winehua_fence_event_wait_count, 1,
+                                memory_order_relaxed);
+   if (result == VK_TIMEOUT)
+      atomic_fetch_add_explicit(&winehua_fence_timeout_count, 1,
+                                memory_order_relaxed);
+   else if (result < 0)
+      atomic_fetch_add_explicit(&winehua_fence_error_count, 1,
+                                memory_order_relaxed);
+
+   if (wait_count != 1 && wait_count % 600 && result >= 0)
+      return;
+
+   struct vn_ring_perf_stats ring;
+   vn_ring_get_perf_stats(dev->primary_ring, &ring);
+   vn_log(dev->instance,
+          "WineHuaGuestPerf: fence waits=%" PRIu64
+          " total_us=%" PRIuFAST64 "/%" PRIuFAST64
+          " status_calls=%" PRIuFAST64 " direct=%" PRIuFAST64
+          " event=%" PRIuFAST64
+          " timeout=%" PRIuFAST64 " errors=%" PRIuFAST64
+          " ring_submit=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+          " ring_mutex=%" PRIu64 "/%" PRIu64 "/%" PRIu64,
+          wait_count,
+          atomic_load_explicit(&winehua_fence_wait_total_us,
+                               memory_order_relaxed),
+          atomic_load_explicit(&winehua_fence_wait_max_us,
+                               memory_order_relaxed),
+          atomic_load_explicit(&winehua_fence_status_call_count,
+                               memory_order_relaxed),
+          atomic_load_explicit(&winehua_fence_direct_wait_count,
+                               memory_order_relaxed),
+          atomic_load_explicit(&winehua_fence_event_wait_count,
+                               memory_order_relaxed),
+          atomic_load_explicit(&winehua_fence_timeout_count,
+                               memory_order_relaxed),
+          atomic_load_explicit(&winehua_fence_error_count,
+                               memory_order_relaxed),
+          ring.submit_count, ring.submit_bytes, ring.submit_total_us,
+          ring.submit_max_us, ring.mutex_wait_count,
+          ring.mutex_wait_total_us, ring.mutex_wait_max_us);
+   vn_log(dev->instance,
+          "WineHuaGuestPerf: ring_wait seqno=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+          " space=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+          " roundtrip_submit=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+          " roundtrip_wait=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+          " notify=%" PRIu64 "/%" PRIu64 "/%" PRIu64,
+          ring.seqno_wait_count, ring.seqno_wait_total_us,
+          ring.seqno_wait_max_us, ring.space_wait_count,
+          ring.space_wait_total_us, ring.space_wait_max_us,
+          ring.roundtrip_submit_count, ring.roundtrip_submit_total_us,
+          ring.roundtrip_submit_max_us, ring.roundtrip_wait_count,
+          ring.roundtrip_wait_total_us, ring.roundtrip_wait_max_us,
+          ring.notify_count, ring.notify_total_us, ring.notify_max_us);
+}
+
+static uint64_t
+vn_winehua_relative_timeout(int64_t abs_timeout)
+{
+   if (abs_timeout == OS_TIMEOUT_INFINITE)
+      return OS_TIMEOUT_INFINITE;
+
+   const int64_t now = os_time_get_nano();
+   return now >= abs_timeout ? 0 : (uint64_t)(abs_timeout - now);
+}
+
+static VkResult
+vn_winehua_prepare_event_fence(struct vn_device *dev,
+                               struct vn_fence *fence,
+                               struct vn_renderer_sync **out_sync,
+                               uint64_t *out_value)
+{
+   VkResult result = VK_NOT_READY;
+
+   simple_mtx_lock(&fence->winehua_event_mutex);
+   if (fence->payload->type != VN_SYNC_TYPE_DEVICE_ONLY ||
+       !fence->external_payload.submission_valid)
+      goto out_unlock;
+
+   if (!fence->winehua_event_sync) {
+      result = vn_renderer_sync_create(dev->renderer, 0, 0,
+                                       &fence->winehua_event_sync);
+      if (result != VK_SUCCESS)
+         goto out_unlock;
+   }
+
+   if (!fence->winehua_event_submitted) {
+      if (fence->winehua_event_value == UINT64_MAX) {
+         result = VK_ERROR_TOO_MANY_OBJECTS;
+         goto out_unlock;
+      }
+
+      struct vn_renderer_sync *sync = fence->winehua_event_sync;
+      const uint64_t next_value = fence->winehua_event_value + 1;
+      struct vn_renderer_submit_batch batch = {
+         .syncs = &sync,
+         .sync_values = &next_value,
+         .sync_count = 1,
+         .ring_idx = fence->external_payload.ring_idx,
+      };
+
+      uint32_t local_data[8];
+      struct vn_cs_encoder local_enc =
+         VN_CS_ENCODER_INITIALIZER_LOCAL(local_data, sizeof(local_data));
+      if (fence->external_payload.ring_seqno_valid) {
+         const uint64_t ring_id = vn_ring_get_id(dev->primary_ring);
+         vn_encode_vkWaitRingSeqnoMESA(
+            &local_enc, 0, ring_id, fence->external_payload.ring_seqno);
+         batch.cs_data = local_data;
+         batch.cs_size = vn_cs_encoder_get_len(&local_enc);
+      }
+
+      const struct vn_renderer_submit submit = {
+         .batches = &batch,
+         .batch_count = 1,
+      };
+      result = vn_renderer_submit(dev->renderer, &submit);
+      if (result != VK_SUCCESS)
+         goto out_unlock;
+
+      fence->winehua_event_value = next_value;
+      fence->winehua_event_submitted = true;
+   }
+
+   *out_sync = fence->winehua_event_sync;
+   *out_value = fence->winehua_event_value;
+   result = VK_SUCCESS;
+
+out_unlock:
+   simple_mtx_unlock(&fence->winehua_event_mutex);
+   return result;
+}
+
+/* Return used_event=false when the optional marker path cannot represent the
+ * requested fences.  The caller then retains the original polling behavior.
+ * A signaled renderer marker is followed by a real zero-time Host fence wait
+ * so device-lost and driver errors are never converted into false success. */
+static VkResult
+vn_winehua_wait_for_fences_event(struct vn_device *dev,
+                                 VkDevice device,
+                                 uint32_t fence_count,
+                                 const VkFence *fences,
+                                 VkBool32 wait_all,
+                                 int64_t abs_timeout,
+                                 uint32_t *status_calls,
+                                 bool *used_event)
+{
+   *status_calls = 0;
+   *used_event = false;
+
+   STACK_ARRAY(struct vn_renderer_sync *, syncs, fence_count);
+   STACK_ARRAY(uint64_t, values, fence_count);
+   if (!syncs || !values) {
+      STACK_ARRAY_FINISH(syncs);
+      STACK_ARRAY_FINISH(values);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+
+   VkResult result = VK_SUCCESS;
+   for (uint32_t i = 0; i < fence_count; i++) {
+      struct vn_fence *fence = vn_fence_from_handle(fences[i]);
+      result = vn_winehua_prepare_event_fence(
+         dev, fence, &syncs[i], &values[i]);
+      if (result != VK_SUCCESS)
+         goto out;
+   }
+
+   const uint64_t remaining = vn_winehua_relative_timeout(abs_timeout);
+   const uint64_t watchdog_ns = 3000000000ull;
+   const bool watchdog = remaining == OS_TIMEOUT_INFINITE ||
+                         remaining > watchdog_ns;
+   const struct vn_renderer_wait wait = {
+      .wait_any = !wait_all,
+      .timeout = watchdog ? watchdog_ns : remaining,
+      .syncs = syncs,
+      .sync_values = values,
+      .sync_count = fence_count,
+   };
+   result = vn_renderer_wait(dev->renderer, &wait);
+   if (result == VK_TIMEOUT && watchdog) {
+      /* A lost event must not turn an infinite Vulkan wait into a deadlock.
+       * The caller continues with the original polling path and deadline. */
+      result = VK_NOT_READY;
+      goto out;
+   }
+   if (result == VK_SUCCESS) {
+      *status_calls = 1;
+      result = vn_call_vkWaitForFences(dev->primary_ring, device, fence_count,
+                                       fences, wait_all, 0);
+      if (result == VK_TIMEOUT) {
+         /* The queue marker and Host fence should become visible together.
+          * Preserve correctness if a driver exposes a short visibility lag. */
+         result = VK_NOT_READY;
+         goto out;
+      }
+   }
+
+   *used_event = true;
+
+out:
+   STACK_ARRAY_FINISH(syncs);
+   STACK_ARRAY_FINISH(values);
+   return result;
+}
+
 VkResult
 vn_WaitForFences(VkDevice device,
                  uint32_t fenceCount,
@@ -1721,10 +1996,38 @@ vn_WaitForFences(VkDevice device,
 {
    VN_TRACE_FUNC();
    struct vn_device *dev = vn_device_from_handle(device);
-   static atomic_uint_fast64_t winehua_wait_count;
-   const int64_t wait_start_ns = os_time_get_nano();
-   const uint32_t original_fence_count = fenceCount;
+   const bool perf_summary =
+      vn_ring_perf_summary_enabled(dev->primary_ring);
+   const int64_t wait_start_ns = perf_summary ? os_time_get_nano() : 0;
+   const int64_t abs_timeout = os_time_get_absolute_timeout(timeout);
    uint32_t status_call_count = 0;
+
+   if (vn_winehua_event_fence_wait_enabled() && fenceCount && timeout) {
+      static atomic_bool logged = ATOMIC_VAR_INIT(false);
+      if (!atomic_exchange_explicit(&logged, true, memory_order_relaxed))
+         vn_log(dev->instance, "WineHua event-driven fence wait enabled");
+
+      bool used_event = false;
+      uint32_t event_status_calls = 0;
+      const VkResult event_result = vn_winehua_wait_for_fences_event(
+         dev, device, fenceCount, pFences, waitAll, abs_timeout,
+         &event_status_calls, &used_event);
+      if (used_event) {
+         if (perf_summary) {
+            const int64_t wait_end_ns = os_time_get_nano();
+            const uint64_t elapsed_us = wait_end_ns > wait_start_ns
+               ? (uint64_t)(wait_end_ns - wait_start_ns) / 1000 : 0;
+            vn_winehua_record_fence_wait(dev, false, true,
+                                         event_status_calls, event_result,
+                                         elapsed_us);
+         } else if (event_result < 0) {
+            vn_log(dev->instance,
+                   "WineHua fence wait mode=event failed result=%d",
+                   event_result);
+         }
+         return vn_result(dev->instance, event_result);
+      }
+   }
 
    const char *direct_wait = os_get_option("VN_WINEHUA_DIRECT_FENCE_WAIT");
    bool all_device_only = direct_wait && direct_wait[0] == '1';
@@ -1741,21 +2044,19 @@ vn_WaitForFences(VkDevice device,
    if (all_device_only && fenceCount) {
       const VkResult result = vn_call_vkWaitForFences(
          dev->primary_ring, device, fenceCount, pFences, waitAll, timeout);
-      const uint64_t wait_id =
-         atomic_fetch_add_explicit(&winehua_wait_count, 1,
-                                   memory_order_relaxed) + 1;
-      const int64_t wait_end_ns = os_time_get_nano();
-      if (wait_id <= 8 || !(wait_id % 120) || result != VK_SUCCESS)
+      if (perf_summary) {
+         const int64_t wait_end_ns = os_time_get_nano();
+         const uint64_t elapsed_us = wait_end_ns > wait_start_ns
+            ? (uint64_t)(wait_end_ns - wait_start_ns) / 1000 : 0;
+         vn_winehua_record_fence_wait(dev, true, false, 0, result,
+                                      elapsed_us);
+      } else if (result < 0) {
          vn_log(dev->instance,
-                "WineHua fence wait mode=direct count=%" PRIu64
-                " fences=%u wait_all=%u timeout_ns=%" PRIu64
-                " status_calls=0 result=%d elapsed_us=%" PRIi64,
-                wait_id, original_fence_count, waitAll, timeout, result,
-                (wait_end_ns - wait_start_ns) / 1000);
+                "WineHua fence wait mode=direct failed result=%d", result);
+      }
       return vn_result(dev->instance, result);
    }
 
-   const int64_t abs_timeout = os_time_get_absolute_timeout(timeout);
    VkResult result = VK_NOT_READY;
    if (fenceCount > 1 && waitAll) {
       STACK_ARRAY(VkFence, fences, fenceCount);
@@ -1784,18 +2085,17 @@ vn_WaitForFences(VkDevice device,
       vn_relax_fini(&relax_state);
    }
 
-   const uint64_t wait_id =
-      atomic_fetch_add_explicit(&winehua_wait_count, 1,
-                                memory_order_relaxed) + 1;
-   const int64_t wait_end_ns = os_time_get_nano();
-   if (wait_id <= 8 || !(wait_id % 120) || result != VK_SUCCESS)
+   if (perf_summary) {
+      const int64_t wait_end_ns = os_time_get_nano();
+      const uint64_t elapsed_us = wait_end_ns > wait_start_ns
+         ? (uint64_t)(wait_end_ns - wait_start_ns) / 1000 : 0;
+      vn_winehua_record_fence_wait(dev, false, false, status_call_count,
+                                   result, elapsed_us);
+   } else if (result < 0) {
       vn_log(dev->instance,
-             "WineHua fence wait mode=polling count=%" PRIu64
-             " fences=%u wait_all=%u timeout_ns=%" PRIu64
-             " status_calls=%u result=%d elapsed_us=%" PRIi64,
-             wait_id, original_fence_count, waitAll, timeout,
-             status_call_count,
-             result, (wait_end_ns - wait_start_ns) / 1000);
+             "WineHua fence wait mode=polling failed status_calls=%u result=%d",
+             status_call_count, result);
+   }
 
    return vn_result(dev->instance, result);
 }

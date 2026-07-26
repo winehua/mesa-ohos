@@ -39,6 +39,31 @@ struct vn_ring_layout {
    size_t shmem_size;
 };
 
+struct vn_ring_perf_stats {
+   uint64_t submit_count;
+   uint64_t submit_bytes;
+   uint64_t submit_total_us;
+   uint64_t submit_max_us;
+   uint64_t mutex_wait_count;
+   uint64_t mutex_wait_total_us;
+   uint64_t mutex_wait_max_us;
+   uint64_t seqno_wait_count;
+   uint64_t seqno_wait_total_us;
+   uint64_t seqno_wait_max_us;
+   uint64_t space_wait_count;
+   uint64_t space_wait_total_us;
+   uint64_t space_wait_max_us;
+   uint64_t roundtrip_submit_count;
+   uint64_t roundtrip_submit_total_us;
+   uint64_t roundtrip_submit_max_us;
+   uint64_t roundtrip_wait_count;
+   uint64_t roundtrip_wait_total_us;
+   uint64_t roundtrip_wait_max_us;
+   uint64_t notify_count;
+   uint64_t notify_total_us;
+   uint64_t notify_max_us;
+};
+
 void
 vn_ring_get_layout(size_t buf_size,
                    size_t extra_size,
@@ -55,6 +80,13 @@ vn_ring_destroy(struct vn_ring *ring);
 
 uint64_t
 vn_ring_get_id(struct vn_ring *ring);
+
+bool
+vn_ring_perf_summary_enabled(const struct vn_ring *ring);
+
+void
+vn_ring_get_perf_stats(const struct vn_ring *ring,
+                       struct vn_ring_perf_stats *stats);
 
 uint32_t
 vn_ring_load_status(const struct vn_ring *ring);

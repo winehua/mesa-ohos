@@ -5,6 +5,7 @@
 
 #include "vn_ring.h"
 
+#include <stdio.h>
 #include <sys/resource.h>
 
 #include "venus-protocol/vn_protocol_driver_transport.h"
@@ -38,6 +39,31 @@ struct vn_ring {
    struct vn_ring_shared shared;
    uint32_t cur;
    bool winehua_strong_publish_barrier;
+   bool winehua_perf_summary;
+   char winehua_perf_log[512];
+
+   atomic_uint_fast64_t perf_submit_count;
+   atomic_uint_fast64_t perf_submit_bytes;
+   atomic_uint_fast64_t perf_submit_total_us;
+   atomic_uint_fast64_t perf_submit_max_us;
+   atomic_uint_fast64_t perf_mutex_wait_count;
+   atomic_uint_fast64_t perf_mutex_wait_total_us;
+   atomic_uint_fast64_t perf_mutex_wait_max_us;
+   atomic_uint_fast64_t perf_seqno_wait_count;
+   atomic_uint_fast64_t perf_seqno_wait_total_us;
+   atomic_uint_fast64_t perf_seqno_wait_max_us;
+   atomic_uint_fast64_t perf_space_wait_count;
+   atomic_uint_fast64_t perf_space_wait_total_us;
+   atomic_uint_fast64_t perf_space_wait_max_us;
+   atomic_uint_fast64_t perf_roundtrip_submit_count;
+   atomic_uint_fast64_t perf_roundtrip_submit_total_us;
+   atomic_uint_fast64_t perf_roundtrip_submit_max_us;
+   atomic_uint_fast64_t perf_roundtrip_wait_count;
+   atomic_uint_fast64_t perf_roundtrip_wait_total_us;
+   atomic_uint_fast64_t perf_roundtrip_wait_max_us;
+   atomic_uint_fast64_t perf_notify_count;
+   atomic_uint_fast64_t perf_notify_total_us;
+   atomic_uint_fast64_t perf_notify_max_us;
 
    /* This mutex ensures below:
     * - atomic of ring submission
@@ -84,6 +110,118 @@ struct vn_ring_submission {
       uint32_t data[64];
    } indirect;
 };
+
+static void
+vn_ring_perf_atomic_max(atomic_uint_fast64_t *value, uint64_t candidate)
+{
+   uint_fast64_t current = atomic_load_explicit(value, memory_order_relaxed);
+   while (current < candidate &&
+          !atomic_compare_exchange_weak_explicit(value, &current, candidate,
+                                                 memory_order_relaxed,
+                                                 memory_order_relaxed))
+      ;
+}
+
+static uint64_t
+vn_ring_perf_elapsed_us(int64_t start_ns)
+{
+   const int64_t end_ns = os_time_get_nano();
+   return end_ns > start_ns ? (uint64_t)(end_ns - start_ns) / 1000 : 0;
+}
+
+static void
+vn_ring_perf_record(atomic_uint_fast64_t *count,
+                    atomic_uint_fast64_t *total_us,
+                    atomic_uint_fast64_t *max_us,
+                    uint64_t elapsed_us)
+{
+   atomic_fetch_add_explicit(count, 1, memory_order_relaxed);
+   atomic_fetch_add_explicit(total_us, elapsed_us, memory_order_relaxed);
+   vn_ring_perf_atomic_max(max_us, elapsed_us);
+}
+
+static void
+vn_ring_perf_record_submit(struct vn_ring *ring,
+                           int64_t start_ns,
+                           uint64_t bytes)
+{
+   if (!ring->winehua_perf_summary)
+      return;
+
+   const uint64_t elapsed_us = vn_ring_perf_elapsed_us(start_ns);
+   vn_ring_perf_record(&ring->perf_submit_count,
+                       &ring->perf_submit_total_us,
+                       &ring->perf_submit_max_us, elapsed_us);
+   atomic_fetch_add_explicit(&ring->perf_submit_bytes, bytes,
+                             memory_order_relaxed);
+}
+
+/* Fence waits are not guaranteed on the DXVK/Venus present path.  Emit the
+ * same ring counters from submission itself when diagnostics are enabled so
+ * long gaps between Guest submissions remain attributable to ring space,
+ * seqno, roundtrip, or the caller.  This is intentionally rate limited and
+ * has no effect when VN_WINEHUA_PERF_SUMMARY is unset. */
+static void
+vn_ring_perf_maybe_log(struct vn_ring *ring)
+{
+   if (!ring->winehua_perf_summary)
+      return;
+
+   const uint64_t submits = atomic_load_explicit(&ring->perf_submit_count,
+                                                  memory_order_relaxed);
+   if (!submits || (submits % 600))
+      return;
+
+   struct vn_ring_perf_stats stats;
+   vn_ring_get_perf_stats(ring, &stats);
+   char message[1024];
+   snprintf(message, sizeof(message),
+            "WineHuaGuestPerf: ring=%" PRIu64
+          " submits=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+          " mutex=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+          " seqno=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+          " space=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+          " roundtrip_submit=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+          " roundtrip_wait=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+          " notify=%" PRIu64 "/%" PRIu64 "/%" PRIu64,
+          ring->id,
+          stats.submit_count, stats.submit_bytes, stats.submit_total_us,
+          stats.submit_max_us,
+          stats.mutex_wait_count, stats.mutex_wait_total_us,
+          stats.mutex_wait_max_us,
+          stats.seqno_wait_count, stats.seqno_wait_total_us,
+          stats.seqno_wait_max_us,
+          stats.space_wait_count, stats.space_wait_total_us,
+          stats.space_wait_max_us,
+          stats.roundtrip_submit_count, stats.roundtrip_submit_total_us,
+          stats.roundtrip_submit_max_us,
+          stats.roundtrip_wait_count, stats.roundtrip_wait_total_us,
+          stats.roundtrip_wait_max_us,
+          stats.notify_count, stats.notify_total_us, stats.notify_max_us);
+   vn_log(ring->instance, "%s", message);
+   if (ring->winehua_perf_log[0]) {
+      FILE *file = fopen(ring->winehua_perf_log, "a");
+      if (file) {
+         fprintf(file, "%s\n", message);
+         fclose(file);
+      }
+   }
+}
+
+static void
+vn_ring_lock(struct vn_ring *ring)
+{
+   const int64_t perf_start_ns = ring->winehua_perf_summary
+                                    ? os_time_get_nano()
+                                    : 0;
+   mtx_lock(&ring->mutex);
+   if (ring->winehua_perf_summary) {
+      const uint64_t elapsed_us = vn_ring_perf_elapsed_us(perf_start_ns);
+      vn_ring_perf_record(&ring->perf_mutex_wait_count,
+                          &ring->perf_mutex_wait_total_us,
+                          &ring->perf_mutex_wait_max_us, elapsed_us);
+   }
+}
 
 static uint32_t
 vn_ring_load_head(const struct vn_ring *ring)
@@ -186,14 +324,24 @@ vn_ring_wait_seqno(struct vn_ring *ring, uint32_t seqno)
    const enum vn_relax_reason reason = ring == ring->instance->ring.ring
                                           ? VN_RELAX_REASON_RING_SEQNO
                                           : VN_RELAX_REASON_TLS_RING_SEQNO;
+   const int64_t perf_start_ns = ring->winehua_perf_summary
+                                    ? os_time_get_nano()
+                                    : 0;
    struct vn_relax_state relax_state = vn_relax_init(ring->instance, reason);
    do {
       if (vn_ring_get_seqno_status(ring, seqno)) {
          vn_relax_fini(&relax_state);
-         return;
+         break;
       }
       vn_relax(&relax_state);
    } while (true);
+
+   if (ring->winehua_perf_summary) {
+      const uint64_t elapsed_us = vn_ring_perf_elapsed_us(perf_start_ns);
+      vn_ring_perf_record(&ring->perf_seqno_wait_count,
+                          &ring->perf_seqno_wait_total_us,
+                          &ring->perf_seqno_wait_max_us, elapsed_us);
+   }
 }
 
 void
@@ -230,6 +378,9 @@ vn_ring_wait_space(struct vn_ring *ring, uint32_t size)
 
    {
       VN_TRACE_FUNC();
+      const int64_t perf_start_ns = ring->winehua_perf_summary
+                                       ? os_time_get_nano()
+                                       : 0;
 
       /* see the reasoning in vn_ring_wait_seqno */
       struct vn_relax_state relax_state =
@@ -238,6 +389,13 @@ vn_ring_wait_space(struct vn_ring *ring, uint32_t size)
          vn_relax(&relax_state);
          if (vn_ring_has_space(ring, size, &head)) {
             vn_relax_fini(&relax_state);
+            if (ring->winehua_perf_summary) {
+               const uint64_t elapsed_us =
+                  vn_ring_perf_elapsed_us(perf_start_ns);
+               vn_ring_perf_record(&ring->perf_space_wait_count,
+                                   &ring->perf_space_wait_total_us,
+                                   &ring->perf_space_wait_max_us, elapsed_us);
+            }
             return head;
          }
       } while (true);
@@ -317,6 +475,15 @@ vn_ring_create(struct vn_instance *instance,
       strong_barrier && strong_barrier[0] == '1';
    if (ring->winehua_strong_publish_barrier)
       vn_log(instance, "WineHua strong ring publish barrier enabled");
+   const char *perf_summary = os_get_option("VN_WINEHUA_PERF_SUMMARY");
+   ring->winehua_perf_summary =
+      perf_summary && perf_summary[0] == '1' && !perf_summary[1];
+   if (ring->winehua_perf_summary) {
+      const char *perf_log = os_get_option("VN_WINEHUA_PERF_LOG");
+      if (perf_log && perf_log[0])
+         snprintf(ring->winehua_perf_log, sizeof(ring->winehua_perf_log),
+                  "%s", perf_log);
+   }
 
    mtx_init(&ring->mutex, mtx_plain);
 
@@ -410,6 +577,43 @@ uint64_t
 vn_ring_get_id(struct vn_ring *ring)
 {
    return ring->id;
+}
+
+bool
+vn_ring_perf_summary_enabled(const struct vn_ring *ring)
+{
+   return ring->winehua_perf_summary;
+}
+
+void
+vn_ring_get_perf_stats(const struct vn_ring *ring,
+                       struct vn_ring_perf_stats *stats)
+{
+#define VN_RING_PERF_LOAD(field)                                                \
+   stats->field = atomic_load_explicit(&ring->perf_##field, memory_order_relaxed)
+   VN_RING_PERF_LOAD(submit_count);
+   VN_RING_PERF_LOAD(submit_bytes);
+   VN_RING_PERF_LOAD(submit_total_us);
+   VN_RING_PERF_LOAD(submit_max_us);
+   VN_RING_PERF_LOAD(mutex_wait_count);
+   VN_RING_PERF_LOAD(mutex_wait_total_us);
+   VN_RING_PERF_LOAD(mutex_wait_max_us);
+   VN_RING_PERF_LOAD(seqno_wait_count);
+   VN_RING_PERF_LOAD(seqno_wait_total_us);
+   VN_RING_PERF_LOAD(seqno_wait_max_us);
+   VN_RING_PERF_LOAD(space_wait_count);
+   VN_RING_PERF_LOAD(space_wait_total_us);
+   VN_RING_PERF_LOAD(space_wait_max_us);
+   VN_RING_PERF_LOAD(roundtrip_submit_count);
+   VN_RING_PERF_LOAD(roundtrip_submit_total_us);
+   VN_RING_PERF_LOAD(roundtrip_submit_max_us);
+   VN_RING_PERF_LOAD(roundtrip_wait_count);
+   VN_RING_PERF_LOAD(roundtrip_wait_total_us);
+   VN_RING_PERF_LOAD(roundtrip_wait_max_us);
+   VN_RING_PERF_LOAD(notify_count);
+   VN_RING_PERF_LOAD(notify_total_us);
+   VN_RING_PERF_LOAD(notify_max_us);
+#undef VN_RING_PERF_LOAD
 }
 
 static struct vn_ring_submit *
@@ -620,19 +824,27 @@ vn_ring_submit_locked(struct vn_ring *ring,
                       struct vn_renderer_shmem *extra_shmem,
                       uint32_t *ring_seqno)
 {
+   const int64_t perf_start_ns = ring->winehua_perf_summary
+                                    ? os_time_get_nano()
+                                    : 0;
+   const uint64_t perf_bytes = vn_cs_encoder_get_len(cs);
    const bool direct = vn_ring_submission_can_direct(ring, cs);
    if (!direct && cs->storage_type == VN_CS_ENCODER_STORAGE_POINTER) {
       cs = vn_ring_cs_upload_locked(ring, cs);
-      if (!cs)
+      if (!cs) {
+         vn_ring_perf_record_submit(ring, perf_start_ns, perf_bytes);
          return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
       assert(cs->storage_type != VN_CS_ENCODER_STORAGE_POINTER);
    }
 
    struct vn_ring_submission submit;
    VkResult result =
       vn_ring_submission_prepare(ring, &submit, cs, extra_shmem, direct);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      vn_ring_perf_record_submit(ring, perf_start_ns, perf_bytes);
       return result;
+   }
 
    uint32_t seqno;
    const bool notify =
@@ -642,8 +854,17 @@ vn_ring_submit_locked(struct vn_ring *ring,
       struct vn_cs_encoder local_enc = VN_CS_ENCODER_INITIALIZER_LOCAL(
          notify_ring_data, sizeof(notify_ring_data));
       vn_encode_vkNotifyRingMESA(&local_enc, 0, ring->id, seqno, 0);
+      const int64_t notify_start_ns = ring->winehua_perf_summary
+                                         ? os_time_get_nano()
+                                         : 0;
       vn_renderer_submit_simple(ring->instance->renderer, notify_ring_data,
                                 vn_cs_encoder_get_len(&local_enc));
+      if (ring->winehua_perf_summary) {
+         const uint64_t notify_us = vn_ring_perf_elapsed_us(notify_start_ns);
+         vn_ring_perf_record(&ring->perf_notify_count,
+                             &ring->perf_notify_total_us,
+                             &ring->perf_notify_max_us, notify_us);
+      }
    }
 
    vn_ring_submission_cleanup(&submit);
@@ -651,6 +872,8 @@ vn_ring_submit_locked(struct vn_ring *ring,
    if (ring_seqno)
       *ring_seqno = seqno;
 
+   vn_ring_perf_record_submit(ring, perf_start_ns, perf_bytes);
+   vn_ring_perf_maybe_log(ring);
    return VK_SUCCESS;
 }
 
@@ -658,7 +881,7 @@ VkResult
 vn_ring_submit_command_simple(struct vn_ring *ring,
                               const struct vn_cs_encoder *cs)
 {
-   mtx_lock(&ring->mutex);
+   vn_ring_lock(ring);
    VkResult result = vn_ring_submit_locked(ring, cs, NULL, NULL);
    mtx_unlock(&ring->mutex);
 
@@ -705,7 +928,7 @@ vn_ring_submit_command(struct vn_ring *ring,
          vn_ring_roundtrip(ring);
    }
 
-   mtx_lock(&ring->mutex);
+   vn_ring_lock(ring);
    if (submit->reply_size) {
       vn_ring_set_reply_shmem_locked(ring, submit->reply_shmem, reply_offset,
                                      submit->reply_size);
@@ -744,6 +967,9 @@ vn_ring_submit_roundtrip(struct vn_ring *ring, uint64_t *roundtrip_seqno)
    uint32_t local_data[8];
    struct vn_cs_encoder local_enc =
       VN_CS_ENCODER_INITIALIZER_LOCAL(local_data, sizeof(local_data));
+   const int64_t perf_start_ns = ring->winehua_perf_summary
+                                    ? os_time_get_nano()
+                                    : 0;
 
    mtx_lock(&ring->roundtrip_mutex);
    const uint64_t seqno = ring->roundtrip_next++;
@@ -753,6 +979,13 @@ vn_ring_submit_roundtrip(struct vn_ring *ring, uint64_t *roundtrip_seqno)
                                 vn_cs_encoder_get_len(&local_enc));
    mtx_unlock(&ring->roundtrip_mutex);
 
+   if (ring->winehua_perf_summary) {
+      const uint64_t elapsed_us = vn_ring_perf_elapsed_us(perf_start_ns);
+      vn_ring_perf_record(&ring->perf_roundtrip_submit_count,
+                          &ring->perf_roundtrip_submit_total_us,
+                          &ring->perf_roundtrip_submit_max_us, elapsed_us);
+   }
+
    *roundtrip_seqno = seqno;
    return result;
 }
@@ -760,5 +993,14 @@ vn_ring_submit_roundtrip(struct vn_ring *ring, uint64_t *roundtrip_seqno)
 void
 vn_ring_wait_roundtrip(struct vn_ring *ring, uint64_t roundtrip_seqno)
 {
+   const int64_t perf_start_ns = ring->winehua_perf_summary
+                                    ? os_time_get_nano()
+                                    : 0;
    vn_async_vkWaitVirtqueueSeqnoMESA(ring, roundtrip_seqno);
+   if (ring->winehua_perf_summary) {
+      const uint64_t elapsed_us = vn_ring_perf_elapsed_us(perf_start_ns);
+      vn_ring_perf_record(&ring->perf_roundtrip_wait_count,
+                          &ring->perf_roundtrip_wait_total_us,
+                          &ring->perf_roundtrip_wait_max_us, elapsed_us);
+   }
 }

@@ -20,6 +20,17 @@
 #include "vn_physical_device.h"
 #include "vn_render_pass.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+static bool
+vn_winehua_pipeline_trace_enabled(void)
+{
+   const char *value = getenv("WINEHUA_VKR_TRACE_PIPELINE");
+   return value && value[0] == '1';
+}
+
 /**
  * Fields in the VkGraphicsPipelineCreateInfo pNext chain that we must track
  * to determine which fields are valid and which must be erased.
@@ -1560,6 +1571,21 @@ vn_CreateGraphicsPipelines(VkDevice device,
       pAllocator ? pAllocator : &dev->base.base.alloc;
    bool want_sync = false;
    VkResult result;
+   const bool trace = vn_winehua_pipeline_trace_enabled();
+
+   if (trace) {
+      fprintf(stderr, "WineHuaGuestPipeline: create count=%u cache=%llu\\n",
+              createInfoCount,
+              (unsigned long long)(uintptr_t)pipelineCache);
+      for (uint32_t i = 0; i < createInfoCount; i++) {
+         const VkGraphicsPipelineCreateInfo *info = &pCreateInfos[i];
+         fprintf(stderr, "WineHuaGuestPipeline: create[%u] stages=%u layout=%llu renderPass=%llu subpass=%u\\n",
+                 i, info->stageCount,
+                 (unsigned long long)(uintptr_t)info->layout,
+                 (unsigned long long)(uintptr_t)info->renderPass,
+                 info->subpass);
+      }
+   }
 
    /* silence -Wmaybe-uninitialized false alarm on release build with gcc */
    if (!createInfoCount)
@@ -1637,7 +1663,10 @@ vn_CreateGraphicsPipelines(VkDevice device,
 
    vk_free(alloc, fix_tmp);
    STACK_ARRAY_FINISH(fix_descs);
-   return vn_result(dev->instance, result);
+   result = vn_result(dev->instance, result);
+   if (trace)
+      fprintf(stderr, "WineHuaGuestPipeline: result=%d\\n", result);
+   return result;
 }
 
 VkResult

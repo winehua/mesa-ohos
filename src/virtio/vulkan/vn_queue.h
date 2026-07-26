@@ -62,6 +62,8 @@ struct vn_sync_payload {
 struct vn_sync_payload_external {
    /* ring_idx of the last queue submission */
    uint32_t ring_idx;
+   /* true after a queue submission has installed this payload */
+   bool submission_valid;
    /* valid when NO_ASYNC_QUEUE_SUBMIT perf option is not used */
    bool ring_seqno_valid;
    /* ring seqno of the last queue submission */
@@ -86,6 +88,16 @@ struct vn_fence {
 
    bool is_external;
    struct vn_sync_payload_external external_payload;
+
+   /* Optional WineHua event-driven wait state.  The renderer sync is a
+    * monotonically increasing timeline reused across fence reset/submission
+    * cycles.  Host access to VkFence wait operations may be concurrent, so
+    * protect lazy marker creation independently of Vulkan's reset/destroy
+    * external-synchronization requirements. */
+   simple_mtx_t winehua_event_mutex;
+   struct vn_renderer_sync *winehua_event_sync;
+   uint64_t winehua_event_value;
+   bool winehua_event_submitted;
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(vn_fence,
                                base.base,
