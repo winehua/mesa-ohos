@@ -38,6 +38,19 @@ struct vtest;
 static atomic_uint_fast64_t winehua_present_paced_waits;
 static atomic_uint_fast64_t winehua_present_paced_wait_us;
 
+static bool
+vn_winehua_present_image_trace_enabled(void)
+{
+   static atomic_int cached = ATOMIC_VAR_INIT(-1);
+   int enabled = atomic_load_explicit(&cached, memory_order_relaxed);
+   if (enabled < 0) {
+      const char *value = os_get_option("WINEHUA_DXVK_TRACE_PRESENT_IMAGE");
+      enabled = value && value[0] == '1' && !value[1];
+      atomic_store_explicit(&cached, enabled, memory_order_relaxed);
+   }
+   return enabled != 0;
+}
+
 struct vtest_shmem {
    struct vn_renderer_shmem base;
 };
@@ -1255,6 +1268,12 @@ vn_winehua_present(VkQueue queue_handle,
       return -EINVAL;
 
    struct vn_device *dev = (void *)queue->base.base.base.device;
+   if (vn_winehua_present_image_trace_enabled())
+      vn_log(dev->instance,
+             "WineHuaPresentImage: layer=guest event=present serial=%u "
+             "rawImage=0x%" PRIx64 " imageId=%" PRIu64 " queueId=%" PRIu64,
+             serial, (uint64_t)(uintptr_t)image_handle, image->base.id,
+             queue->base.id);
    const uint64_t pacing_deadline_ns =
       queue->winehua_next_present_deadline_ns;
    queue->winehua_next_present_deadline_ns = 0;
