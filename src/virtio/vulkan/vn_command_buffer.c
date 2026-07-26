@@ -21,8 +21,38 @@
 #include "vn_query_pool.h"
 #include "vn_render_pass.h"
 
+#include <stdatomic.h>
+
 static void
 vn_cmd_submit(struct vn_command_buffer *cmd);
+
+#define VN_WINEHUA_DESCRIPTOR_TRACE_LIMIT 100000u
+
+static bool
+vn_winehua_descriptor_trace_enabled(void)
+{
+   static atomic_int cached = ATOMIC_VAR_INIT(-1);
+   int enabled = atomic_load_explicit(&cached, memory_order_relaxed);
+   if (enabled < 0) {
+      const char *value = os_get_option("WINEHUA_DXVK_TRACE_CAMERA");
+      enabled = value && value[0] == '1' && !value[1];
+      atomic_store_explicit(&cached, enabled, memory_order_relaxed);
+   }
+   return enabled != 0;
+}
+
+static bool
+vn_winehua_descriptor_trace_allow(void)
+{
+   static atomic_uint emitted = ATOMIC_VAR_INIT(0);
+   const unsigned index =
+      atomic_fetch_add_explicit(&emitted, 1, memory_order_relaxed);
+   if (index < VN_WINEHUA_DESCRIPTOR_TRACE_LIMIT)
+      return true;
+   if (index == VN_WINEHUA_DESCRIPTOR_TRACE_LIMIT)
+      fprintf(stderr, "WineHuaGuestDescriptor: trace limit reached\n");
+   return false;
+}
 
 #define VN_CMD_ENQUEUE(cmd_name, commandBuffer, ...)                         \
    do {                                                                      \
@@ -1236,6 +1266,24 @@ vn_CmdBindDescriptorSets(VkCommandBuffer commandBuffer,
                          uint32_t dynamicOffsetCount,
                          const uint32_t *pDynamicOffsets)
 {
+   if (vn_winehua_descriptor_trace_enabled() &&
+       pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+      struct vn_command_buffer *cmd =
+         vn_command_buffer_from_handle(commandBuffer);
+      for (uint32_t i = 0; i < descriptorSetCount; i++) {
+         struct vn_descriptor_set *set =
+            vn_descriptor_set_from_handle(pDescriptorSets[i]);
+         if (!vn_winehua_descriptor_trace_allow())
+            break;
+         fprintf(stderr,
+                 "WineHuaGuestDescriptor: unixPid=%d bind guestCmd=0x%" PRIxPTR
+                 " cmdId=%" PRIu64 " firstSet=%u setIndex=%u"
+                 " guestSet=0x%" PRIxPTR " setId=%" PRIu64 "\n",
+                 getpid(), (uintptr_t)commandBuffer, cmd->base.id, firstSet, i,
+                 (uintptr_t)pDescriptorSets[i], set ? set->base.id : 0);
+      }
+   }
+
    VN_CMD_ENQUEUE(vkCmdBindDescriptorSets, commandBuffer, pipelineBindPoint,
                   layout, firstSet, descriptorSetCount, pDescriptorSets,
                   dynamicOffsetCount, pDynamicOffsets);
