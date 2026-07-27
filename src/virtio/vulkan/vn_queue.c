@@ -1705,7 +1705,18 @@ vn_GetFenceStatus(VkDevice device, VkFence _fence)
                                      VK_TRUE, UINT64_MAX);
          }
       } else {
+         const int64_t perf_start_ns =
+            vn_ring_perf_summary_enabled(dev->primary_ring)
+               ? os_time_get_nano() : 0;
          result = vn_call_vkGetFenceStatus(dev->primary_ring, device, _fence);
+         if (perf_start_ns) {
+            const int64_t perf_end_ns = os_time_get_nano();
+            const uint64_t elapsed_us = perf_end_ns > perf_start_ns
+               ? (uint64_t)(perf_end_ns - perf_start_ns) / 1000ull : 0;
+            vn_ring_perf_record_rpc(dev->primary_ring,
+                                    VN_RING_PERF_RPC_FENCE_STATUS,
+                                    elapsed_us, result);
+         }
       }
       break;
    case VN_SYNC_TYPE_IMPORTED_SYNC_FD:

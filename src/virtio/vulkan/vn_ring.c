@@ -15,6 +15,7 @@
 #include "vn_renderer.h"
 
 #define VN_RING_IDLE_TIMEOUT_NS (1ull * 1000 * 1000)
+#define VN_RING_PERF_COMMAND_TYPE_COUNT 512
 
 static_assert(ATOMIC_INT_LOCK_FREE == 2 && sizeof(atomic_uint) == 4,
               "vn_ring_shared requires lock-free 32-bit atomic_uint");
@@ -64,6 +65,20 @@ struct vn_ring {
    atomic_uint_fast64_t perf_notify_count;
    atomic_uint_fast64_t perf_notify_total_us;
    atomic_uint_fast64_t perf_notify_max_us;
+   atomic_uint_fast64_t perf_fence_status_count;
+   atomic_uint_fast64_t perf_fence_status_total_us;
+   atomic_uint_fast64_t perf_fence_status_max_us;
+   atomic_uint_fast64_t perf_fence_status_not_ready;
+   atomic_uint_fast64_t perf_query_results_count;
+   atomic_uint_fast64_t perf_query_results_total_us;
+   atomic_uint_fast64_t perf_query_results_max_us;
+   atomic_uint_fast64_t perf_query_results_not_ready;
+   atomic_uint_fast64_t
+      perf_reply_count[VN_RING_PERF_COMMAND_TYPE_COUNT];
+   atomic_uint_fast64_t
+      perf_reply_total_us[VN_RING_PERF_COMMAND_TYPE_COUNT];
+   atomic_uint_fast64_t
+      perf_reply_max_us[VN_RING_PERF_COMMAND_TYPE_COUNT];
 
    /* This mutex ensures below:
     * - atomic of ring submission
@@ -169,7 +184,10 @@ vn_ring_perf_maybe_log(struct vn_ring *ring)
 
    const uint64_t submits = atomic_load_explicit(&ring->perf_submit_count,
                                                   memory_order_relaxed);
-   if (!submits || (submits % 600))
+   /* Heaven can issue several thousand ring submissions per frame.  Keep the
+    * non-present fallback useful without turning diagnostics into a render
+    * bottleneck; present workloads emit a frame-aligned summary separately. */
+   if (!submits || (submits % 600000))
       return;
 
    struct vn_ring_perf_stats stats;
@@ -586,6 +604,90 @@ vn_ring_perf_summary_enabled(const struct vn_ring *ring)
 }
 
 void
+vn_ring_perf_record_rpc(struct vn_ring *ring,
+                        enum vn_ring_perf_rpc rpc,
+                        uint64_t elapsed_us,
+                        VkResult result)
+{
+   if (!ring->winehua_perf_summary)
+      return;
+
+   atomic_uint_fast64_t *count;
+   atomic_uint_fast64_t *total_us;
+   atomic_uint_fast64_t *max_us;
+   atomic_uint_fast64_t *not_ready;
+   switch (rpc) {
+   case VN_RING_PERF_RPC_FENCE_STATUS:
+      count = &ring->perf_fence_status_count;
+      total_us = &ring->perf_fence_status_total_us;
+      max_us = &ring->perf_fence_status_max_us;
+      not_ready = &ring->perf_fence_status_not_ready;
+      break;
+   case VN_RING_PERF_RPC_QUERY_RESULTS:
+      count = &ring->perf_query_results_count;
+      total_us = &ring->perf_query_results_total_us;
+      max_us = &ring->perf_query_results_max_us;
+      not_ready = &ring->perf_query_results_not_ready;
+      break;
+   default:
+      unreachable("invalid WineHua ring performance RPC");
+   }
+
+   vn_ring_perf_record(count, total_us, max_us, elapsed_us);
+   if (result == VK_NOT_READY)
+      atomic_fetch_add_explicit(not_ready, 1, memory_order_relaxed);
+}
+
+static void
+vn_ring_perf_record_reply(struct vn_ring *ring,
+                          VkCommandTypeEXT command_type,
+                          uint64_t elapsed_us)
+{
+   const uint32_t type = (uint32_t)command_type;
+   if (!ring->winehua_perf_summary ||
+       type >= VN_RING_PERF_COMMAND_TYPE_COUNT)
+      return;
+
+   atomic_fetch_add_explicit(&ring->perf_reply_count[type], 1,
+                             memory_order_relaxed);
+   atomic_fetch_add_explicit(&ring->perf_reply_total_us[type], elapsed_us,
+                             memory_order_relaxed);
+   vn_ring_perf_atomic_max(&ring->perf_reply_max_us[type], elapsed_us);
+}
+
+void
+vn_ring_get_perf_top_replies(
+   const struct vn_ring *ring,
+   struct vn_ring_perf_reply_stat stats[VN_RING_PERF_TOP_REPLY_COUNT])
+{
+   memset(stats, 0, sizeof(*stats) * VN_RING_PERF_TOP_REPLY_COUNT);
+   for (uint32_t type = 0; type < VN_RING_PERF_COMMAND_TYPE_COUNT; type++) {
+      const uint64_t total_us = atomic_load_explicit(
+         &ring->perf_reply_total_us[type], memory_order_relaxed);
+      if (!total_us)
+         continue;
+
+      uint32_t index = 0;
+      while (index < VN_RING_PERF_TOP_REPLY_COUNT &&
+             stats[index].total_us >= total_us)
+         index++;
+      if (index == VN_RING_PERF_TOP_REPLY_COUNT)
+         continue;
+      for (uint32_t move = VN_RING_PERF_TOP_REPLY_COUNT - 1;
+           move > index; move--)
+         stats[move] = stats[move - 1];
+      stats[index] = (struct vn_ring_perf_reply_stat) {
+         .command_type = type,
+         .count = atomic_load_explicit(&ring->perf_reply_count[type],
+                                       memory_order_relaxed),
+         .total_us = total_us,
+         .max_us = atomic_load_explicit(&ring->perf_reply_max_us[type],
+                                        memory_order_relaxed),
+      };
+   }
+}
+
+void
 vn_ring_get_perf_stats(const struct vn_ring *ring,
                        struct vn_ring_perf_stats *stats)
 {
@@ -613,6 +715,14 @@ vn_ring_get_perf_stats(const struct vn_ring *ring,
    VN_RING_PERF_LOAD(notify_count);
    VN_RING_PERF_LOAD(notify_total_us);
    VN_RING_PERF_LOAD(notify_max_us);
+   VN_RING_PERF_LOAD(fence_status_count);
+   VN_RING_PERF_LOAD(fence_status_total_us);
+   VN_RING_PERF_LOAD(fence_status_max_us);
+   VN_RING_PERF_LOAD(fence_status_not_ready);
+   VN_RING_PERF_LOAD(query_results_count);
+   VN_RING_PERF_LOAD(query_results_total_us);
+   VN_RING_PERF_LOAD(query_results_max_us);
+   VN_RING_PERF_LOAD(query_results_not_ready);
 #undef VN_RING_PERF_LOAD
 }
 
@@ -914,6 +1024,12 @@ vn_ring_submit_command(struct vn_ring *ring,
 {
    assert(!vn_cs_encoder_is_empty(&submit->command));
 
+   VkCommandTypeEXT command_type = (VkCommandTypeEXT)UINT32_MAX;
+   if (ring->winehua_perf_summary &&
+       vn_cs_encoder_get_len(&submit->command) >= sizeof(command_type))
+      memcpy(&command_type, submit->command.buffers[0].base,
+             sizeof(command_type));
+
    vn_cs_encoder_commit(&submit->command);
 
    size_t reply_offset = 0;
@@ -944,7 +1060,14 @@ vn_ring_submit_command(struct vn_ring *ring,
          void *reply_ptr = submit->reply_shmem->mmap_ptr + reply_offset;
          submit->reply =
             VN_CS_DECODER_INITIALIZER(reply_ptr, submit->reply_size);
+         const int64_t reply_wait_start_ns = ring->winehua_perf_summary
+                                                ? os_time_get_nano() : 0;
          vn_ring_wait_seqno(ring, submit->ring_seqno);
+         if (ring->winehua_perf_summary) {
+            const uint64_t elapsed_us =
+               vn_ring_perf_elapsed_us(reply_wait_start_ns);
+            vn_ring_perf_record_reply(ring, command_type, elapsed_us);
+         }
       } else {
          vn_renderer_shmem_unref(ring->instance->renderer,
                                  submit->reply_shmem);

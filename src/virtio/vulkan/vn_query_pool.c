@@ -15,6 +15,7 @@
 #include "vn_device.h"
 #include "vn_feedback.h"
 #include "vn_physical_device.h"
+#include "vn_ring.h"
 
 /* query pool commands */
 
@@ -316,9 +317,19 @@ vn_GetQueryPoolResults(VkDevice device,
       if (!packed_data)
          return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
+   const int64_t perf_start_ns =
+      vn_ring_perf_summary_enabled(dev->primary_ring) ? os_time_get_nano() : 0;
    result = vn_call_vkGetQueryPoolResults(
       dev->primary_ring, device, queryPool, firstQuery, queryCount,
       packed_size, packed_data, packed_stride, packed_flags);
+   if (perf_start_ns) {
+      const int64_t perf_end_ns = os_time_get_nano();
+      const uint64_t elapsed_us = perf_end_ns > perf_start_ns
+         ? (uint64_t)(perf_end_ns - perf_start_ns) / 1000ull : 0;
+      vn_ring_perf_record_rpc(dev->primary_ring,
+                              VN_RING_PERF_RPC_QUERY_RESULTS,
+                              elapsed_us, result);
+   }
 
    if (packed_data == pData)
       return vn_result(dev->instance, result);

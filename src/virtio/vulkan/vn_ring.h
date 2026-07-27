@@ -62,6 +62,28 @@ struct vn_ring_perf_stats {
    uint64_t notify_count;
    uint64_t notify_total_us;
    uint64_t notify_max_us;
+   uint64_t fence_status_count;
+   uint64_t fence_status_total_us;
+   uint64_t fence_status_max_us;
+   uint64_t fence_status_not_ready;
+   uint64_t query_results_count;
+   uint64_t query_results_total_us;
+   uint64_t query_results_max_us;
+   uint64_t query_results_not_ready;
+};
+
+#define VN_RING_PERF_TOP_REPLY_COUNT 8
+
+struct vn_ring_perf_reply_stat {
+   uint32_t command_type;
+   uint64_t count;
+   uint64_t total_us;
+   uint64_t max_us;
+};
+
+enum vn_ring_perf_rpc {
+   VN_RING_PERF_RPC_FENCE_STATUS,
+   VN_RING_PERF_RPC_QUERY_RESULTS,
 };
 
 void
@@ -87,6 +109,17 @@ vn_ring_perf_summary_enabled(const struct vn_ring *ring);
 void
 vn_ring_get_perf_stats(const struct vn_ring *ring,
                        struct vn_ring_perf_stats *stats);
+
+void
+vn_ring_perf_record_rpc(struct vn_ring *ring,
+                        enum vn_ring_perf_rpc rpc,
+                        uint64_t elapsed_us,
+                        VkResult result);
+
+void
+vn_ring_get_perf_top_replies(
+   const struct vn_ring *ring,
+   struct vn_ring_perf_reply_stat stats[VN_RING_PERF_TOP_REPLY_COUNT]);
 
 uint32_t
 vn_ring_load_status(const struct vn_ring *ring);
