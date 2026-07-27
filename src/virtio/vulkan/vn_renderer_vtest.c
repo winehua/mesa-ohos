@@ -1319,18 +1319,29 @@ vn_winehua_present(VkQueue queue_handle,
    };
 
    /* The private present request uses the vtest socket while Vulkan object
-    * creation and queue submission travel through the Venus ring.  Complete
-    * a renderer roundtrip so the host object table and VkQueue have observed
-    * all earlier commands before the out-of-band present lookup.  A renderer
-    * worker can still publish the queue/image entry just after that roundtrip
-    * returns, so treat -EAGAIN as a bounded publication race and retry here.
-    * Never expose that transient errno to Wine: the Vulkan thunk maps a
-    * negative result to DEVICE_LOST, poisoning an otherwise valid x86 process.
-    * This is not a GPU idle wait; execution remains ordered by the same host
-    * queue. */
+    * creation and queue submission travel through the Venus ring.  A Venus
+    * roundtrip only inserts a cross-transport marker; it does not wait for the
+    * ring worker to consume commands before returning.  Drain through that
+    * marker before the out-of-band lookup so present cannot acquire the Host
+    * queue mutex ahead of the producer QueueSubmit.  This waits for renderer
+    * decode and the Host driver's QueueSubmit call, not GPU completion.
+    *
+    * Treat -EAGAIN as a bounded object-publication race and retry here.  Never
+    * expose that transient errno to Wine: the Vulkan thunk maps a negative
+    * result to DEVICE_LOST, poisoning an otherwise valid x86 process. */
    int result = -EAGAIN;
    for (unsigned attempt = 0; attempt < 8 && result == -EAGAIN; attempt++) {
+      const int64_t drain_start_ns = os_time_get_nano();
       vn_ring_roundtrip(dev->primary_ring);
+      vn_ring_wait_all(dev->primary_ring);
+      if (vtest_winehua_present_trace_enabled()) {
+         const int64_t drain_end_ns = os_time_get_nano();
+         const uint64_t drain_us = drain_end_ns > drain_start_ns
+            ? (uint64_t)(drain_end_ns - drain_start_ns) / 1000ull : 0;
+         vn_log(dev->instance,
+                "winehua vk present: ring drained serial=%u attempt=%u wait_us=%" PRIu64,
+                serial, attempt + 1, drain_us);
+      }
       result = vn_renderer_winehua_present(dev->renderer, &present);
       if (result == -EAGAIN) {
          vn_log(dev->instance,
