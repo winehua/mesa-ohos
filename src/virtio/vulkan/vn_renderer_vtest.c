@@ -37,6 +37,21 @@ struct vtest;
 
 static atomic_uint_fast64_t winehua_present_paced_waits;
 static atomic_uint_fast64_t winehua_present_paced_wait_us;
+static atomic_uint_fast64_t winehua_present_ring_drain_count;
+static atomic_uint_fast64_t winehua_present_ring_drain_total_us;
+static atomic_uint_fast64_t winehua_present_ring_drain_max_us;
+static atomic_uint_fast64_t winehua_present_ring_drain_retries;
+
+static void
+vn_winehua_atomic_max(atomic_uint_fast64_t *value, uint64_t candidate)
+{
+   uint_fast64_t current = atomic_load_explicit(value, memory_order_relaxed);
+   while (current < candidate &&
+          !atomic_compare_exchange_weak_explicit(value, &current, candidate,
+                                                 memory_order_relaxed,
+                                                 memory_order_relaxed))
+      ;
+}
 
 static bool
 vn_winehua_present_image_trace_enabled(void)
@@ -1329,18 +1344,27 @@ vn_winehua_present(VkQueue queue_handle,
     * Treat -EAGAIN as a bounded object-publication race and retry here.  Never
     * expose that transient errno to Wine: the Vulkan thunk maps a negative
     * result to DEVICE_LOST, poisoning an otherwise valid x86 process. */
+   const bool drain_perf =
+      vn_ring_perf_summary_enabled(dev->primary_ring);
+   uint64_t present_drain_us = 0;
+   unsigned present_drain_attempts = 0;
    int result = -EAGAIN;
    for (unsigned attempt = 0; attempt < 8 && result == -EAGAIN; attempt++) {
-      const int64_t drain_start_ns = os_time_get_nano();
+      present_drain_attempts = attempt + 1;
+      const int64_t drain_start_ns =
+         (drain_perf || vtest_winehua_present_trace_enabled())
+            ? os_time_get_nano() : 0;
       vn_ring_roundtrip(dev->primary_ring);
       vn_ring_wait_all(dev->primary_ring);
-      if (vtest_winehua_present_trace_enabled()) {
+      if (drain_start_ns) {
          const int64_t drain_end_ns = os_time_get_nano();
          const uint64_t drain_us = drain_end_ns > drain_start_ns
             ? (uint64_t)(drain_end_ns - drain_start_ns) / 1000ull : 0;
-         vn_log(dev->instance,
-                "winehua vk present: ring drained serial=%u attempt=%u wait_us=%" PRIu64,
-                serial, attempt + 1, drain_us);
+         present_drain_us += drain_us;
+         if (vtest_winehua_present_trace_enabled())
+            vn_log(dev->instance,
+                   "winehua vk present: ring drained serial=%u attempt=%u wait_us=%" PRIu64,
+                   serial, attempt + 1, drain_us);
       }
       result = vn_renderer_winehua_present(dev->renderer, &present);
       if (result == -EAGAIN) {
@@ -1349,6 +1373,32 @@ vn_winehua_present(VkQueue queue_handle,
                 serial, attempt + 1);
          usleep(1000u << attempt);
       }
+   }
+
+   if (drain_perf) {
+      const uint64_t count = atomic_fetch_add_explicit(
+         &winehua_present_ring_drain_count, 1, memory_order_relaxed) + 1;
+      const uint64_t total_us = atomic_fetch_add_explicit(
+         &winehua_present_ring_drain_total_us, present_drain_us,
+         memory_order_relaxed) + present_drain_us;
+      vn_winehua_atomic_max(&winehua_present_ring_drain_max_us,
+                            present_drain_us);
+      const uint64_t retries = present_drain_attempts > 1
+         ? atomic_fetch_add_explicit(
+              &winehua_present_ring_drain_retries,
+              present_drain_attempts - 1, memory_order_relaxed) +
+              present_drain_attempts - 1
+         : atomic_load_explicit(&winehua_present_ring_drain_retries,
+                                memory_order_relaxed);
+      if (count <= 8 || !(count % 120))
+         vn_log(dev->instance,
+                "winehua vk present: ring drain summary presents=%" PRIu64
+                " total_us=%" PRIu64 " avg_us=%" PRIu64
+                " max_us=%" PRIuFAST64 " retries=%" PRIu64,
+                count, total_us, total_us / count,
+                atomic_load_explicit(&winehua_present_ring_drain_max_us,
+                                     memory_order_relaxed),
+                retries);
    }
 
    if ((result == 0 || result == 1) && next_present_deadline_ns)
