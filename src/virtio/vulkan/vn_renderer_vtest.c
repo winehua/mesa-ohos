@@ -1319,7 +1319,7 @@ vn_winehua_present(VkQueue queue_handle,
          const uint64_t total_us = atomic_fetch_add_explicit(
             &winehua_present_paced_wait_us, waited_us,
             memory_order_relaxed) + waited_us;
-         if (wait_count <= 8 || !(wait_count % 120))
+         if (drain_perf && (wait_count <= 8 || !(wait_count % 120)))
             vn_log(dev->instance,
                    "winehua vk present: paced_waits=%" PRIu64
                    " last_us=%" PRIu64 " total_us=%" PRIu64,

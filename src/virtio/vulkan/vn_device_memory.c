@@ -484,6 +484,7 @@ vn_MapMemory(VkDevice device,
       return vn_error(dev->instance, VK_ERROR_MEMORY_MAP_FAILED);
    }
 
+   mem->map_offset = offset;
    mem->map_end = size == VK_WHOLE_SIZE ? mem_vk->size : offset + size;
 
    *ppData = ptr + offset;
@@ -494,6 +495,33 @@ vn_MapMemory(VkDevice device,
 void
 vn_UnmapMemory(VkDevice device, VkDeviceMemory memory)
 {
+   struct vn_device *dev = vn_device_from_handle(device);
+   struct vn_device_memory *mem = vn_device_memory_from_handle(memory);
+   const struct vk_device_memory *mem_vk = &mem->base.base;
+   const VkMemoryPropertyFlags property_flags =
+      dev->physical_device->memory_properties
+         .memoryTypes[mem_vk->memory_type_index]
+         .propertyFlags;
+   const char *remote_sync = os_get_option("VN_WINEHUA_REMOTE_MEMORY_SYNC");
+
+   /* A normal Venus BO maps Host memory directly. WineHua's fallback uses a
+    * separate Guest shadow mapping, so HOST_COHERENT writes made by an app
+    * between Map and Unmap would otherwise never enter the Host dirty list.
+    * Publish the mapped range at the Vulkan synchronization boundary. */
+   if (remote_sync && remote_sync[0] == '1' && mem->base_bo &&
+       (property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) &&
+       mem->map_end > mem->map_offset) {
+      const VkMappedMemoryRange range = {
+         .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+         .memory = memory,
+         .offset = mem->map_offset,
+         .size = mem->map_end - mem->map_offset,
+      };
+      (void)vn_FlushMappedMemoryRanges(device, 1, &range);
+   }
+
+   mem->map_offset = 0;
+   mem->map_end = 0;
 }
 
 VkResult

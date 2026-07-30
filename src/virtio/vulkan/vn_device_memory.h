@@ -47,6 +47,7 @@ struct vn_device_memory {
    bool bo_roundtrip_seqno_valid;
    uint64_t bo_roundtrip_seqno;
 
+   VkDeviceSize map_offset;
    VkDeviceSize map_end;
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(vn_device_memory,

@@ -40,6 +40,9 @@ struct vn_ring {
    struct vn_ring_shared shared;
    uint32_t cur;
    bool winehua_strong_publish_barrier;
+   bool winehua_force_notify;
+   bool winehua_force_notify_trace;
+   uint64_t winehua_force_notify_trace_count;
    bool winehua_perf_summary;
    char winehua_perf_log[512];
 
@@ -493,6 +496,25 @@ vn_ring_create(struct vn_instance *instance,
       strong_barrier && strong_barrier[0] == '1';
    if (ring->winehua_strong_publish_barrier)
       vn_log(instance, "WineHua strong ring publish barrier enabled");
+   const char *force_notify = os_get_option("VN_WINEHUA_ALWAYS_NOTIFY_RING");
+   const char *remote_sync = os_get_option("VN_WINEHUA_REMOTE_MEMORY_SYNC");
+   /* With WineHua's separate Guest/Host shadow mappings, the renderer-owned
+    * IDLE word cannot be used as a wake-up predicate by the Guest.  Keep the
+    * normal 1 ms notification coalescing, but notify independently of that
+    * stale status so object creation is visible before private present. */
+   ring->winehua_force_notify =
+      (force_notify && force_notify[0] == '1') ||
+      (remote_sync && remote_sync[0] == '1');
+   const char *force_notify_trace =
+      os_get_option("VN_WINEHUA_RING_NOTIFY_TRACE");
+   ring->winehua_force_notify_trace =
+      force_notify_trace && force_notify_trace[0] == '1' &&
+      !force_notify_trace[1];
+   ring->winehua_force_notify_trace_count = 0;
+   if (ring->winehua_force_notify)
+      vn_log(instance, "WineHua shadow ring notification enabled");
+   if (ring->winehua_force_notify_trace)
+      vn_log(instance, "WineHua shadow ring notification tracing enabled");
    const char *perf_summary = os_get_option("VN_WINEHUA_PERF_SUMMARY");
    ring->winehua_perf_summary =
       perf_summary && perf_summary[0] == '1' && !perf_summary[1];
@@ -783,7 +805,8 @@ vn_ring_submit_internal(struct vn_ring *ring,
     * has passed since the last sent notification to avoid excessive wake up
     * calls (non-trivial since submitted via virtio-gpu kernel).
     */
-   if (status & VK_RING_STATUS_IDLE_BIT_MESA) {
+   if (ring->winehua_force_notify ||
+       (status & VK_RING_STATUS_IDLE_BIT_MESA)) {
       const int64_t now = os_time_get_nano();
       if (os_time_timeout(ring->last_notify, ring->next_notify, now)) {
          ring->last_notify = now;
@@ -960,6 +983,14 @@ vn_ring_submit_locked(struct vn_ring *ring,
    const bool notify =
       vn_ring_submit_internal(ring, submit.submit, submit.cs, &seqno);
    if (notify) {
+      if (ring->winehua_force_notify_trace) {
+         const uint64_t count = ++ring->winehua_force_notify_trace_count;
+         if (count <= 8 || !(count % 120))
+            vn_log(ring->instance,
+                   "WineHua ring notify send id=%" PRIu64
+                   " seqno=%u status=0x%x count=%" PRIu64,
+                   ring->id, seqno, vn_ring_load_status(ring), count);
+      }
       uint32_t notify_ring_data[8];
       struct vn_cs_encoder local_enc = VN_CS_ENCODER_INITIALIZER_LOCAL(
          notify_ring_data, sizeof(notify_ring_data));
