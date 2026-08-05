@@ -41,6 +41,7 @@ struct vn_ring {
    uint32_t cur;
    bool winehua_strong_publish_barrier;
    bool winehua_force_notify;
+   bool winehua_always_notify;
    bool winehua_force_notify_trace;
    uint64_t winehua_force_notify_trace_count;
    bool winehua_perf_summary;
@@ -499,11 +500,14 @@ vn_ring_create(struct vn_instance *instance,
    const char *force_notify = os_get_option("VN_WINEHUA_ALWAYS_NOTIFY_RING");
    const char *remote_sync = os_get_option("VN_WINEHUA_REMOTE_MEMORY_SYNC");
    /* With WineHua's separate Guest/Host shadow mappings, the renderer-owned
-    * IDLE word cannot be used as a wake-up predicate by the Guest.  Keep the
-    * normal 1 ms notification coalescing, but notify independently of that
-    * stale status so object creation is visible before private present. */
-   ring->winehua_force_notify =
-      (force_notify && force_notify[0] == '1') ||
+    * IDLE word cannot be used as a reliable wake-up predicate by the Guest.
+    * Remote-memory mode keeps the normal 1 ms notification coalescing for
+    * compatibility.  ALWAYS_NOTIFY deliberately bypasses that window: two
+    * sub-millisecond submissions can otherwise coalesce after the Host has
+    * already gone idle, leaving a later ring-seqno wait without a wake-up. */
+   ring->winehua_always_notify =
+      force_notify && force_notify[0] == '1' && !force_notify[1];
+   ring->winehua_force_notify = ring->winehua_always_notify ||
       (remote_sync && remote_sync[0] == '1');
    const char *force_notify_trace =
       os_get_option("VN_WINEHUA_RING_NOTIFY_TRACE");
@@ -513,6 +517,8 @@ vn_ring_create(struct vn_instance *instance,
    ring->winehua_force_notify_trace_count = 0;
    if (ring->winehua_force_notify)
       vn_log(instance, "WineHua shadow ring notification enabled");
+   if (ring->winehua_always_notify)
+      vn_log(instance, "WineHua uncoalesced ring notification enabled");
    if (ring->winehua_force_notify_trace)
       vn_log(instance, "WineHua shadow ring notification tracing enabled");
    const char *perf_summary = os_get_option("VN_WINEHUA_PERF_SUMMARY");
@@ -805,6 +811,8 @@ vn_ring_submit_internal(struct vn_ring *ring,
     * has passed since the last sent notification to avoid excessive wake up
     * calls (non-trivial since submitted via virtio-gpu kernel).
     */
+   if (ring->winehua_always_notify)
+      return true;
    if (ring->winehua_force_notify ||
        (status & VK_RING_STATUS_IDLE_BIT_MESA)) {
       const int64_t now = os_time_get_nano();
