@@ -460,6 +460,8 @@ vn_device_init(struct vn_device *dev,
    dev->device_mask = 1;
    dev->renderer = instance->renderer;
    dev->primary_ring = instance->ring.ring;
+   list_inithead(&dev->mapped_memories);
+   simple_mtx_init(&dev->mapped_memory_mutex, mtx_plain);
 
    create_info =
       vn_device_fix_create_info(dev, create_info, alloc, &local_create_info);

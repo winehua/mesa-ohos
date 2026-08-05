@@ -1100,6 +1100,12 @@ vn_queue_submit(struct vn_queue_submission *submit)
    if (result != VK_SUCCESS)
       return vn_error(instance, result);
 
+   /* WineHua's remote shadow transport cannot observe writes which remain in
+    * a persistently mapped coherent Guest allocation. Publish those ranges
+    * before the renderer consumes command buffers that reference them. This
+    * path is opt-in and currently enabled only for the VKD3D profile. */
+   vn_device_memory_flush_persistent_mappings(dev);
+
    /* skip no-op submit */
    if (!submit->batch_count && submit->fence_handle == VK_NULL_HANDLE)
       return VK_SUCCESS;

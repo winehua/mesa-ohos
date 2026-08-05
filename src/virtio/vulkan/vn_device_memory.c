@@ -25,6 +25,105 @@
 
 /* device memory commands */
 
+static bool
+vn_winehua_persistent_map_sync_enabled(void)
+{
+   static atomic_int cached = ATOMIC_VAR_INIT(-1);
+   int enabled = atomic_load_explicit(&cached, memory_order_relaxed);
+   if (enabled < 0) {
+      const char *value =
+         os_get_option("VN_WINEHUA_PERSISTENT_MAP_SYNC");
+      enabled = value && value[0] == '1' && !value[1];
+      atomic_store_explicit(&cached, enabled, memory_order_relaxed);
+   }
+   return enabled != 0;
+}
+
+static bool
+vn_winehua_persistent_map_trace_enabled(void)
+{
+   static atomic_int cached = ATOMIC_VAR_INIT(-1);
+   int enabled = atomic_load_explicit(&cached, memory_order_relaxed);
+   if (enabled < 0) {
+      const char *value =
+         os_get_option("VN_WINEHUA_PERSISTENT_MAP_SYNC_TRACE");
+      enabled = value && value[0] == '1' && !value[1];
+      atomic_store_explicit(&cached, enabled, memory_order_relaxed);
+   }
+   return enabled != 0;
+}
+
+static void
+vn_device_memory_untrack_mapping(struct vn_device *dev,
+                                 struct vn_device_memory *mem)
+{
+   simple_mtx_lock(&dev->mapped_memory_mutex);
+   if (mem->mapped) {
+      list_delinit(&mem->mapped_head);
+      mem->mapped = false;
+   }
+   mem->map_offset = 0;
+   mem->map_end = 0;
+   simple_mtx_unlock(&dev->mapped_memory_mutex);
+}
+
+void
+vn_device_memory_flush_persistent_mappings(struct vn_device *dev)
+{
+   if (!vn_winehua_persistent_map_sync_enabled())
+      return;
+
+   VkDevice device = vn_device_to_handle(dev);
+   uint32_t flush_count = 0;
+
+   /* Vulkan requires host access to VkDeviceMemory to be externally
+    * synchronized. The mutex additionally protects this bookkeeping from
+    * well-behaved applications mapping or unmapping another allocation on a
+    * different thread while the queue is submitted. */
+   simple_mtx_lock(&dev->mapped_memory_mutex);
+   list_for_each_entry(struct vn_device_memory, mem, &dev->mapped_memories,
+                       mapped_head) {
+      const struct vk_device_memory *mem_vk = &mem->base.base;
+      const VkMemoryPropertyFlags property_flags =
+         dev->physical_device->memory_properties
+            .memoryTypes[mem_vk->memory_type_index]
+            .propertyFlags;
+      if (!mem->base_bo ||
+          !(property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ||
+          mem->map_end <= mem->map_offset)
+         continue;
+
+      const VkMappedMemoryRange range = {
+         .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+         .memory = vn_device_memory_to_handle(mem),
+         .offset = mem->map_offset,
+         .size = mem->map_end - mem->map_offset,
+      };
+      const VkResult result =
+         vn_FlushMappedMemoryRanges(device, 1, &range);
+      if (result != VK_SUCCESS) {
+         vn_log(dev->instance,
+                "WineHua persistent-map flush failed: memory=%" PRIu64
+                " offset=%" PRIu64 " size=%" PRIu64 " result=%d",
+                mem->base.id, range.offset, range.size, result);
+         continue;
+      }
+
+      flush_count++;
+      if (vn_winehua_persistent_map_trace_enabled()) {
+         vn_log(dev->instance,
+                "WineHua persistent-map flush: memory=%" PRIu64
+                " offset=%" PRIu64 " size=%" PRIu64,
+                mem->base.id, range.offset, range.size);
+      }
+   }
+   simple_mtx_unlock(&dev->mapped_memory_mutex);
+
+   if (flush_count && vn_winehua_persistent_map_trace_enabled())
+      vn_log(dev->instance, "WineHua persistent-map submit flushes=%u",
+             flush_count);
+}
+
 static inline VkResult
 vn_device_memory_alloc_simple(struct vn_device *dev,
                               struct vn_device_memory *mem,
@@ -380,6 +479,7 @@ vn_AllocateMemory(VkDevice device,
    if (!mem)
       return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   list_inithead(&mem->mapped_head);
    vn_object_set_id(mem, vn_get_next_obj_id(), VK_OBJECT_TYPE_DEVICE_MEMORY);
 
    VkResult result;
@@ -413,6 +513,8 @@ vn_FreeMemory(VkDevice device,
    struct vn_device_memory *mem = vn_device_memory_from_handle(memory);
    if (!mem)
       return;
+
+   vn_device_memory_untrack_mapping(dev, mem);
 
    vn_device_memory_emit_report(dev, mem, /* is_alloc */ false, VK_SUCCESS);
 
@@ -487,6 +589,13 @@ vn_MapMemory(VkDevice device,
    mem->map_offset = offset;
    mem->map_end = size == VK_WHOLE_SIZE ? mem_vk->size : offset + size;
 
+   simple_mtx_lock(&dev->mapped_memory_mutex);
+   if (!mem->mapped) {
+      list_addtail(&mem->mapped_head, &dev->mapped_memories);
+      mem->mapped = true;
+   }
+   simple_mtx_unlock(&dev->mapped_memory_mutex);
+
    *ppData = ptr + offset;
 
    return VK_SUCCESS;
@@ -520,8 +629,7 @@ vn_UnmapMemory(VkDevice device, VkDeviceMemory memory)
       (void)vn_FlushMappedMemoryRanges(device, 1, &range);
    }
 
-   mem->map_offset = 0;
-   mem->map_end = 0;
+   vn_device_memory_untrack_mapping(dev, mem);
 }
 
 VkResult

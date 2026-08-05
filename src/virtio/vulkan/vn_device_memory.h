@@ -16,6 +16,13 @@
 struct vn_device_memory {
    struct vn_device_memory_base base;
 
+   /* WineHua's remote-memory transport uses distinct Guest and Host
+    * mappings. Track live mappings so coherent persistent writes can be
+    * published immediately before a queue submission when explicitly
+    * enabled for VKD3D. */
+   struct list_head mapped_head;
+   bool mapped;
+
    /* non-NULL when mappable or external */
    struct vn_renderer_bo *base_bo;
 
@@ -67,5 +74,8 @@ vn_get_memory_dma_buf_properties(struct vn_device *dev,
                                  int fd,
                                  uint64_t *out_alloc_size,
                                  uint32_t *out_mem_type_bits);
+
+void
+vn_device_memory_flush_persistent_mappings(struct vn_device *dev);
 
 #endif /* VN_DEVICE_MEMORY_H */
