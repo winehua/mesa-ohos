@@ -64,6 +64,8 @@ vn_device_memory_untrack_mapping(struct vn_device *dev,
    }
    mem->map_offset = 0;
    mem->map_end = 0;
+   atomic_store_explicit(&mem->persistent_map_write_seen, false,
+                         memory_order_relaxed);
    simple_mtx_unlock(&dev->mapped_memory_mutex);
 }
 
@@ -90,6 +92,8 @@ vn_device_memory_flush_persistent_mappings(struct vn_device *dev)
             .propertyFlags;
       if (!mem->base_bo ||
           !(property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ||
+          !atomic_load_explicit(&mem->persistent_map_write_seen,
+                                memory_order_relaxed) ||
           mem->map_end <= mem->map_offset)
          continue;
 
@@ -480,6 +484,7 @@ vn_AllocateMemory(VkDevice device,
       return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    list_inithead(&mem->mapped_head);
+   atomic_init(&mem->persistent_map_write_seen, false);
    vn_object_set_id(mem, vn_get_next_obj_id(), VK_OBJECT_TYPE_DEVICE_MEMORY);
 
    VkResult result;
@@ -643,6 +648,10 @@ vn_FlushMappedMemoryRanges(VkDevice device,
       const VkMappedMemoryRange *range = &pMemoryRanges[i];
       struct vn_device_memory *mem =
          vn_device_memory_from_handle(range->memory);
+
+      if (vn_winehua_persistent_map_sync_enabled())
+         atomic_store_explicit(&mem->persistent_map_write_seen, true,
+                               memory_order_relaxed);
 
       const VkDeviceSize size = range->size == VK_WHOLE_SIZE
                                    ? mem->map_end - range->offset

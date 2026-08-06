@@ -22,6 +22,9 @@ struct vn_device_memory {
     * enabled for VKD3D. */
    struct list_head mapped_head;
    bool mapped;
+   /* Explicit flushes classify an allocation as CPU-written. Readback-only
+    * mappings must never be published Guest-to-Host before later submits. */
+   atomic_bool persistent_map_write_seen;
 
    /* non-NULL when mappable or external */
    struct vn_renderer_bo *base_bo;
