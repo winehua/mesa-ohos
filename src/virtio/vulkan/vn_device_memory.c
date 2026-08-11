@@ -26,6 +26,7 @@
 /* device memory commands */
 
 #define VN_WINEHUA_PERSISTENT_FLUSH_BATCH_SIZE 256
+#define VN_WINEHUA_PERSISTENT_RANGE_LIMIT 1024
 
 static bool
 vn_winehua_async_memory_flush_enabled(void)
@@ -69,6 +70,120 @@ vn_winehua_persistent_map_trace_enabled(void)
 }
 
 static void
+vn_device_memory_record_persistent_flush_range(
+   struct vn_device *dev, struct vn_device_memory *mem,
+   VkDeviceSize offset, VkDeviceSize size)
+{
+   if (!vn_winehua_persistent_map_sync_enabled())
+      return;
+
+   atomic_store_explicit(&mem->persistent_map_write_seen, true,
+                         memory_order_relaxed);
+
+   simple_mtx_lock(&dev->mapped_memory_mutex);
+   if (!mem->mapped || mem->persistent_flush_range_overflow ||
+       mem->map_end <= mem->map_offset) {
+      simple_mtx_unlock(&dev->mapped_memory_mutex);
+      return;
+   }
+
+   VkDeviceSize begin = MAX2(offset, mem->map_offset);
+   VkDeviceSize end = mem->map_end;
+   if (size != VK_WHOLE_SIZE && begin < end && size < end - begin)
+      end = begin + size;
+   if (begin >= end) {
+      simple_mtx_unlock(&dev->mapped_memory_mutex);
+      return;
+   }
+
+   /* Map-time flushes identify persistently CPU-written D3D12 upload
+    * resources. Keep disjoint suballocation ranges instead of widening every
+    * submit to the entire VkDeviceMemory allocation. */
+   for (uint32_t i = 0; i < mem->persistent_flush_range_count;) {
+      const struct vn_winehua_persistent_flush_range *range =
+         &mem->persistent_flush_ranges[i];
+      if (range->end < begin || range->offset > end) {
+         i++;
+         continue;
+      }
+
+      begin = MIN2(begin, range->offset);
+      end = MAX2(end, range->end);
+      mem->persistent_flush_ranges[i] = mem->persistent_flush_ranges[
+         --mem->persistent_flush_range_count];
+   }
+
+   if (mem->persistent_flush_range_count ==
+       mem->persistent_flush_range_capacity) {
+      if (mem->persistent_flush_range_capacity >=
+          VN_WINEHUA_PERSISTENT_RANGE_LIMIT) {
+         mem->persistent_flush_range_overflow = true;
+         simple_mtx_unlock(&dev->mapped_memory_mutex);
+         return;
+      }
+
+      uint32_t new_capacity = mem->persistent_flush_range_capacity
+         ? mem->persistent_flush_range_capacity * 2 : 16;
+      new_capacity = MIN2(new_capacity, VN_WINEHUA_PERSISTENT_RANGE_LIMIT);
+      struct vn_winehua_persistent_flush_range *new_ranges = realloc(
+         mem->persistent_flush_ranges, sizeof(*new_ranges) * new_capacity);
+      if (!new_ranges) {
+         mem->persistent_flush_range_overflow = true;
+         simple_mtx_unlock(&dev->mapped_memory_mutex);
+         return;
+      }
+      mem->persistent_flush_ranges = new_ranges;
+      mem->persistent_flush_range_capacity = new_capacity;
+   }
+
+   mem->persistent_flush_ranges[mem->persistent_flush_range_count++] =
+      (struct vn_winehua_persistent_flush_range) {
+         .offset = begin,
+         .end = end,
+      };
+   simple_mtx_unlock(&dev->mapped_memory_mutex);
+}
+
+static VkResult
+vn_device_memory_flush_ranges(struct vn_device *dev, VkDevice device,
+                              uint32_t memory_range_count,
+                              const VkMappedMemoryRange *memory_ranges,
+                              bool record_persistent_ranges)
+{
+   for (uint32_t i = 0; i < memory_range_count; i++) {
+      const VkMappedMemoryRange *range = &memory_ranges[i];
+      struct vn_device_memory *mem =
+         vn_device_memory_from_handle(range->memory);
+
+      if (record_persistent_ranges)
+         vn_device_memory_record_persistent_flush_range(
+            dev, mem, range->offset, range->size);
+
+      const VkDeviceSize size = range->size == VK_WHOLE_SIZE
+                                   ? mem->map_end - range->offset
+                                   : range->size;
+      vn_renderer_bo_flush(dev->renderer, mem->base_bo, range->offset, size);
+   }
+
+   const char *remote_sync = os_get_option("VN_WINEHUA_REMOTE_MEMORY_SYNC");
+   if (remote_sync && remote_sync[0] == '1' &&
+       vn_winehua_async_memory_flush_enabled()) {
+      struct vn_ring_submit_command submit;
+      vn_submit_vkFlushMappedMemoryRanges(dev->primary_ring, 0, device,
+                                          memory_range_count, memory_ranges,
+                                          &submit);
+      return submit.ring_seqno_valid ? VK_SUCCESS
+                                     : VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   if (remote_sync && remote_sync[0] == '1')
+      return vn_call_vkFlushMappedMemoryRanges(dev->primary_ring, device,
+                                               memory_range_count,
+                                               memory_ranges);
+
+   return VK_SUCCESS;
+}
+
+static void
 vn_device_memory_untrack_mapping(struct vn_device *dev,
                                  struct vn_device_memory *mem)
 {
@@ -81,6 +196,11 @@ vn_device_memory_untrack_mapping(struct vn_device *dev,
    mem->map_end = 0;
    atomic_store_explicit(&mem->persistent_map_write_seen, false,
                          memory_order_relaxed);
+   free(mem->persistent_flush_ranges);
+   mem->persistent_flush_ranges = NULL;
+   mem->persistent_flush_range_count = 0;
+   mem->persistent_flush_range_capacity = 0;
+   mem->persistent_flush_range_overflow = false;
    simple_mtx_unlock(&dev->mapped_memory_mutex);
 }
 
@@ -115,37 +235,52 @@ vn_device_memory_flush_persistent_mappings(struct vn_device *dev)
           mem->map_end <= mem->map_offset)
          continue;
 
-      ranges[range_count++] = (VkMappedMemoryRange) {
-         .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-         .memory = vn_device_memory_to_handle(mem),
-         .offset = mem->map_offset,
-         .size = mem->map_end - mem->map_offset,
-      };
-      flush_count++;
-      if (vn_winehua_persistent_map_trace_enabled()) {
-         vn_log(dev->instance,
-                "WineHua persistent-map flush: memory=%" PRIu64
-                " offset=%" PRIu64 " size=%" PRIu64,
-                mem->base.id, mem->map_offset,
-                mem->map_end - mem->map_offset);
-      }
-
-      if (range_count == ARRAY_SIZE(ranges)) {
-         const VkResult result = vn_FlushMappedMemoryRanges(
-            device, range_count, ranges);
-         if (result != VK_SUCCESS) {
+      const uint32_t persistent_range_count =
+         mem->persistent_flush_range_overflow ||
+         !mem->persistent_flush_range_count
+            ? 1 : mem->persistent_flush_range_count;
+      for (uint32_t i = 0; i < persistent_range_count; i++) {
+         const VkDeviceSize offset =
+            mem->persistent_flush_range_overflow ||
+            !mem->persistent_flush_range_count
+               ? mem->map_offset : mem->persistent_flush_ranges[i].offset;
+         const VkDeviceSize end =
+            mem->persistent_flush_range_overflow ||
+            !mem->persistent_flush_range_count
+               ? mem->map_end : mem->persistent_flush_ranges[i].end;
+         ranges[range_count++] = (VkMappedMemoryRange) {
+            .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+            .memory = vn_device_memory_to_handle(mem),
+            .offset = offset,
+            .size = end - offset,
+         };
+         flush_count++;
+         if (vn_winehua_persistent_map_trace_enabled()) {
             vn_log(dev->instance,
-                   "WineHua persistent-map flush batch failed: "
-                   "ranges=%u result=%d", range_count, result);
+                   "WineHua persistent-map flush: memory=%" PRIu64
+                   " offset=%" PRIu64 " size=%" PRIu64 " fallback=%u",
+                   mem->base.id, offset, end - offset,
+                   mem->persistent_flush_range_overflow ||
+                   !mem->persistent_flush_range_count);
          }
-         batch_count++;
-         range_count = 0;
+
+         if (range_count == ARRAY_SIZE(ranges)) {
+            const VkResult result = vn_device_memory_flush_ranges(
+               dev, device, range_count, ranges, false);
+            if (result != VK_SUCCESS) {
+               vn_log(dev->instance,
+                      "WineHua persistent-map flush batch failed: "
+                      "ranges=%u result=%d", range_count, result);
+            }
+            batch_count++;
+            range_count = 0;
+         }
       }
    }
 
    if (range_count) {
-      const VkResult result =
-         vn_FlushMappedMemoryRanges(device, range_count, ranges);
+      const VkResult result = vn_device_memory_flush_ranges(
+         dev, device, range_count, ranges, false);
       if (result != VK_SUCCESS) {
          vn_log(dev->instance,
                 "WineHua persistent-map flush batch failed: "
@@ -518,6 +653,10 @@ vn_AllocateMemory(VkDevice device,
 
    list_inithead(&mem->mapped_head);
    atomic_init(&mem->persistent_map_write_seen, false);
+   mem->persistent_flush_ranges = NULL;
+   mem->persistent_flush_range_count = 0;
+   mem->persistent_flush_range_capacity = 0;
+   mem->persistent_flush_range_overflow = false;
    vn_object_set_id(mem, vn_get_next_obj_id(), VK_OBJECT_TYPE_DEVICE_MEMORY);
 
    VkResult result;
@@ -677,40 +816,12 @@ vn_FlushMappedMemoryRanges(VkDevice device,
 {
    struct vn_device *dev = vn_device_from_handle(device);
 
-   for (uint32_t i = 0; i < memoryRangeCount; i++) {
-      const VkMappedMemoryRange *range = &pMemoryRanges[i];
-      struct vn_device_memory *mem =
-         vn_device_memory_from_handle(range->memory);
-
-      if (vn_winehua_persistent_map_sync_enabled())
-         atomic_store_explicit(&mem->persistent_map_write_seen, true,
-                               memory_order_relaxed);
-
-      const VkDeviceSize size = range->size == VK_WHOLE_SIZE
-                                   ? mem->map_end - range->offset
-                                   : range->size;
-      vn_renderer_bo_flush(dev->renderer, mem->base_bo, range->offset, size);
-   }
-
    /* WineHua's vtest transport maps an OHOS shadow file rather than the Host
     * VkDeviceMemory itself.  Its local bo flush is therefore insufficient:
     * publish the ranges through the existing Venus protocol so the renderer
     * can update the Host mapping before queue submission or fence refresh. */
-   const char *remote_sync = os_get_option("VN_WINEHUA_REMOTE_MEMORY_SYNC");
-   if (remote_sync && remote_sync[0] == '1' &&
-       vn_winehua_async_memory_flush_enabled()) {
-      struct vn_ring_submit_command submit;
-      vn_submit_vkFlushMappedMemoryRanges(dev->primary_ring, 0, device,
-                                          memoryRangeCount, pMemoryRanges,
-                                          &submit);
-      return submit.ring_seqno_valid ? VK_SUCCESS
-                                     : VK_ERROR_OUT_OF_HOST_MEMORY;
-   }
-   if (remote_sync && remote_sync[0] == '1')
-      return vn_call_vkFlushMappedMemoryRanges(dev->primary_ring, device,
-                                               memoryRangeCount, pMemoryRanges);
-
-   return VK_SUCCESS;
+   return vn_device_memory_flush_ranges(dev, device, memoryRangeCount,
+                                        pMemoryRanges, true);
 }
 
 VkResult

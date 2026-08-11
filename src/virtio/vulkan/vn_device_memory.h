@@ -13,6 +13,11 @@
 
 #include "vn_common.h"
 
+struct vn_winehua_persistent_flush_range {
+   VkDeviceSize offset;
+   VkDeviceSize end;
+};
+
 struct vn_device_memory {
    struct vn_device_memory_base base;
 
@@ -25,6 +30,10 @@ struct vn_device_memory {
    /* Explicit flushes classify an allocation as CPU-written. Readback-only
     * mappings must never be published Guest-to-Host before later submits. */
    atomic_bool persistent_map_write_seen;
+   struct vn_winehua_persistent_flush_range *persistent_flush_ranges;
+   uint32_t persistent_flush_range_count;
+   uint32_t persistent_flush_range_capacity;
+   bool persistent_flush_range_overflow;
 
    /* non-NULL when mappable or external */
    struct vn_renderer_bo *base_bo;
