@@ -25,6 +25,21 @@
 
 /* device memory commands */
 
+#define VN_WINEHUA_PERSISTENT_FLUSH_BATCH_SIZE 256
+
+static bool
+vn_winehua_async_memory_flush_enabled(void)
+{
+   static atomic_int cached = ATOMIC_VAR_INIT(-1);
+   int enabled = atomic_load_explicit(&cached, memory_order_relaxed);
+   if (enabled < 0) {
+      const char *value = os_get_option("VN_WINEHUA_ASYNC_MEMORY_FLUSH");
+      enabled = value && value[0] == '1' && !value[1];
+      atomic_store_explicit(&cached, enabled, memory_order_relaxed);
+   }
+   return enabled != 0;
+}
+
 static bool
 vn_winehua_persistent_map_sync_enabled(void)
 {
@@ -76,7 +91,10 @@ vn_device_memory_flush_persistent_mappings(struct vn_device *dev)
       return;
 
    VkDevice device = vn_device_to_handle(dev);
+   VkMappedMemoryRange ranges[VN_WINEHUA_PERSISTENT_FLUSH_BATCH_SIZE];
+   uint32_t range_count = 0;
    uint32_t flush_count = 0;
+   uint32_t batch_count = 0;
 
    /* Vulkan requires host access to VkDeviceMemory to be externally
     * synchronized. The mutex additionally protects this bookkeeping from
@@ -97,35 +115,50 @@ vn_device_memory_flush_persistent_mappings(struct vn_device *dev)
           mem->map_end <= mem->map_offset)
          continue;
 
-      const VkMappedMemoryRange range = {
+      ranges[range_count++] = (VkMappedMemoryRange) {
          .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
          .memory = vn_device_memory_to_handle(mem),
          .offset = mem->map_offset,
          .size = mem->map_end - mem->map_offset,
       };
-      const VkResult result =
-         vn_FlushMappedMemoryRanges(device, 1, &range);
-      if (result != VK_SUCCESS) {
-         vn_log(dev->instance,
-                "WineHua persistent-map flush failed: memory=%" PRIu64
-                " offset=%" PRIu64 " size=%" PRIu64 " result=%d",
-                mem->base.id, range.offset, range.size, result);
-         continue;
-      }
-
       flush_count++;
       if (vn_winehua_persistent_map_trace_enabled()) {
          vn_log(dev->instance,
                 "WineHua persistent-map flush: memory=%" PRIu64
                 " offset=%" PRIu64 " size=%" PRIu64,
-                mem->base.id, range.offset, range.size);
+                mem->base.id, mem->map_offset,
+                mem->map_end - mem->map_offset);
       }
+
+      if (range_count == ARRAY_SIZE(ranges)) {
+         const VkResult result = vn_FlushMappedMemoryRanges(
+            device, range_count, ranges);
+         if (result != VK_SUCCESS) {
+            vn_log(dev->instance,
+                   "WineHua persistent-map flush batch failed: "
+                   "ranges=%u result=%d", range_count, result);
+         }
+         batch_count++;
+         range_count = 0;
+      }
+   }
+
+   if (range_count) {
+      const VkResult result =
+         vn_FlushMappedMemoryRanges(device, range_count, ranges);
+      if (result != VK_SUCCESS) {
+         vn_log(dev->instance,
+                "WineHua persistent-map flush batch failed: "
+                "ranges=%u result=%d", range_count, result);
+      }
+      batch_count++;
    }
    simple_mtx_unlock(&dev->mapped_memory_mutex);
 
    if (flush_count && vn_winehua_persistent_map_trace_enabled())
-      vn_log(dev->instance, "WineHua persistent-map submit flushes=%u",
-             flush_count);
+      vn_log(dev->instance,
+             "WineHua persistent-map submit flushes=%u batches=%u",
+             flush_count, batch_count);
 }
 
 static inline VkResult
@@ -664,6 +697,15 @@ vn_FlushMappedMemoryRanges(VkDevice device,
     * publish the ranges through the existing Venus protocol so the renderer
     * can update the Host mapping before queue submission or fence refresh. */
    const char *remote_sync = os_get_option("VN_WINEHUA_REMOTE_MEMORY_SYNC");
+   if (remote_sync && remote_sync[0] == '1' &&
+       vn_winehua_async_memory_flush_enabled()) {
+      struct vn_ring_submit_command submit;
+      vn_submit_vkFlushMappedMemoryRanges(dev->primary_ring, 0, device,
+                                          memoryRangeCount, pMemoryRanges,
+                                          &submit);
+      return submit.ring_seqno_valid ? VK_SUCCESS
+                                     : VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
    if (remote_sync && remote_sync[0] == '1')
       return vn_call_vkFlushMappedMemoryRanges(dev->primary_ring, device,
                                                memoryRangeCount, pMemoryRanges);
