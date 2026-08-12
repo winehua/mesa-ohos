@@ -23,6 +23,8 @@
 #include "vn_renderer.h"
 #include "vn_renderer_util.h"
 
+#include "util/os_time.h"
+
 /* device memory commands */
 
 #define VN_WINEHUA_PERSISTENT_FLUSH_BATCH_SIZE 256
@@ -67,6 +69,27 @@ vn_winehua_persistent_map_trace_enabled(void)
       atomic_store_explicit(&cached, enabled, memory_order_relaxed);
    }
    return enabled != 0;
+}
+
+static bool
+vn_winehua_persistent_map_verbose_enabled(void)
+{
+   static atomic_int cached = ATOMIC_VAR_INIT(-1);
+   int enabled = atomic_load_explicit(&cached, memory_order_relaxed);
+   if (enabled < 0) {
+      const char *value = os_get_option(
+         "VN_WINEHUA_PERSISTENT_MAP_SYNC_VERBOSE");
+      enabled = value && value[0] == '1' && !value[1];
+      atomic_store_explicit(&cached, enabled, memory_order_relaxed);
+   }
+   return enabled != 0;
+}
+
+static const char *
+vn_winehua_smoke_label(const char *name)
+{
+   const char *value = os_get_option(name);
+   return value && value[0] ? value : "manual";
 }
 
 static void
@@ -215,6 +238,22 @@ vn_device_memory_flush_persistent_mappings(struct vn_device *dev)
    uint32_t range_count = 0;
    uint32_t flush_count = 0;
    uint32_t batch_count = 0;
+   uint32_t allocation_count = 0;
+   uint32_t whole_map_count = 0;
+   uint64_t flush_bytes = 0;
+   const bool trace = vn_winehua_persistent_map_trace_enabled();
+   const bool verbose = trace &&
+      vn_winehua_persistent_map_verbose_enabled();
+   const char *run_id = trace
+      ? vn_winehua_smoke_label("WINEHUA_SMOKE_RUN_ID") : "";
+   const char *test_id = trace
+      ? vn_winehua_smoke_label("WINEHUA_SMOKE_TEST_ID") : "";
+   const int64_t begin_ns = trace ? os_time_get_nano() : 0;
+   static atomic_uint_fast64_t submit_count = ATOMIC_VAR_INIT(0);
+   static atomic_uint_fast64_t cumulative_ranges = ATOMIC_VAR_INIT(0);
+   static atomic_uint_fast64_t cumulative_bytes = ATOMIC_VAR_INIT(0);
+   static atomic_uint_fast64_t cumulative_batches = ATOMIC_VAR_INIT(0);
+   static atomic_uint_fast64_t cumulative_whole_maps = ATOMIC_VAR_INIT(0);
 
    /* Vulkan requires host access to VkDeviceMemory to be externally
     * synchronized. The mutex additionally protects this bookkeeping from
@@ -235,19 +274,19 @@ vn_device_memory_flush_persistent_mappings(struct vn_device *dev)
           mem->map_end <= mem->map_offset)
          continue;
 
+      if (trace)
+         allocation_count++;
+      const bool whole_map = mem->persistent_flush_range_overflow ||
+         !mem->persistent_flush_range_count;
+      if (trace)
+         whole_map_count += whole_map;
       const uint32_t persistent_range_count =
-         mem->persistent_flush_range_overflow ||
-         !mem->persistent_flush_range_count
-            ? 1 : mem->persistent_flush_range_count;
+         whole_map ? 1 : mem->persistent_flush_range_count;
       for (uint32_t i = 0; i < persistent_range_count; i++) {
          const VkDeviceSize offset =
-            mem->persistent_flush_range_overflow ||
-            !mem->persistent_flush_range_count
-               ? mem->map_offset : mem->persistent_flush_ranges[i].offset;
+            whole_map ? mem->map_offset : mem->persistent_flush_ranges[i].offset;
          const VkDeviceSize end =
-            mem->persistent_flush_range_overflow ||
-            !mem->persistent_flush_range_count
-               ? mem->map_end : mem->persistent_flush_ranges[i].end;
+            whole_map ? mem->map_end : mem->persistent_flush_ranges[i].end;
          ranges[range_count++] = (VkMappedMemoryRange) {
             .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
             .memory = vn_device_memory_to_handle(mem),
@@ -255,13 +294,15 @@ vn_device_memory_flush_persistent_mappings(struct vn_device *dev)
             .size = end - offset,
          };
          flush_count++;
-         if (vn_winehua_persistent_map_trace_enabled()) {
+         if (trace)
+            flush_bytes += end - offset;
+         if (verbose) {
             vn_log(dev->instance,
-                   "WineHua persistent-map flush: memory=%" PRIu64
+                   "WineHua persistent-map runId=%.80s testId=%.80s"
+                   " flush: memory=%" PRIu64
                    " offset=%" PRIu64 " size=%" PRIu64 " fallback=%u",
-                   mem->base.id, offset, end - offset,
-                   mem->persistent_flush_range_overflow ||
-                   !mem->persistent_flush_range_count);
+                   run_id, test_id, mem->base.id, offset, end - offset,
+                   (unsigned)whole_map);
          }
 
          if (range_count == ARRAY_SIZE(ranges)) {
@@ -290,10 +331,34 @@ vn_device_memory_flush_persistent_mappings(struct vn_device *dev)
    }
    simple_mtx_unlock(&dev->mapped_memory_mutex);
 
-   if (flush_count && vn_winehua_persistent_map_trace_enabled())
-      vn_log(dev->instance,
-             "WineHua persistent-map submit flushes=%u batches=%u",
-             flush_count, batch_count);
+   if (flush_count && trace) {
+      const uint64_t elapsed_us =
+         (uint64_t)(os_time_get_nano() - begin_ns) / 1000;
+      const uint64_t submit = atomic_fetch_add_explicit(
+         &submit_count, 1, memory_order_relaxed) + 1;
+      const uint64_t total_ranges = atomic_fetch_add_explicit(
+         &cumulative_ranges, flush_count, memory_order_relaxed) + flush_count;
+      const uint64_t total_bytes = atomic_fetch_add_explicit(
+         &cumulative_bytes, flush_bytes, memory_order_relaxed) + flush_bytes;
+      const uint64_t total_batches = atomic_fetch_add_explicit(
+         &cumulative_batches, batch_count, memory_order_relaxed) + batch_count;
+      const uint64_t total_whole_maps = atomic_fetch_add_explicit(
+         &cumulative_whole_maps, whole_map_count, memory_order_relaxed) +
+         whole_map_count;
+      if (submit <= 17 || submit == 64 || submit == 1024 ||
+          submit == 1025 || !(submit % 120))
+         vn_log(dev->instance,
+                "WineHua persistent-map runId=%.80s testId=%.80s"
+                " submit=%" PRIu64
+                " allocations=%u replayRanges=%u replayBytes=%" PRIu64
+                " batches=%u wholeMaps=%u guestReplayUs=%" PRIu64
+                " cumulativeRanges=%" PRIu64 " cumulativeBytes=%" PRIu64
+                " cumulativeBatches=%" PRIu64 " cumulativeWholeMaps=%" PRIu64,
+                run_id, test_id, submit, allocation_count,
+                flush_count, flush_bytes, batch_count, whole_map_count,
+                elapsed_us, total_ranges, total_bytes, total_batches,
+                total_whole_maps);
+   }
 }
 
 static inline VkResult
