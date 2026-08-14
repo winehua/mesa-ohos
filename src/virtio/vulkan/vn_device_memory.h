@@ -34,6 +34,7 @@ struct vn_device_memory {
    uint32_t persistent_flush_range_count;
    uint32_t persistent_flush_range_capacity;
    bool persistent_flush_range_overflow;
+   uint64_t persistent_flush_generation;
 
    /* non-NULL when mappable or external */
    struct vn_renderer_bo *base_bo;

@@ -502,7 +502,7 @@ vn_GetPipelineCacheData(VkDevice device,
       return VK_SUCCESS;
    }
 
-   if (*pDataSize <= sizeof(*header)) {
+   if (*pDataSize < sizeof(*header)) {
       *pDataSize = 0;
       return VK_INCOMPLETE;
    }

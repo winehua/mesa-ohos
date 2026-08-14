@@ -46,6 +46,47 @@ vn_winehua_event_fence_wait_enabled(void)
 }
 
 static bool
+vn_winehua_direct_semaphore_wait_enabled(void)
+{
+   static atomic_int cached = ATOMIC_VAR_INIT(-1);
+   int enabled = atomic_load_explicit(&cached, memory_order_relaxed);
+   if (enabled < 0) {
+      const char *value =
+         os_get_option("VN_WINEHUA_DIRECT_SEMAPHORE_WAIT");
+      enabled = value && value[0] == '1' && !value[1];
+      atomic_store_explicit(&cached, enabled, memory_order_relaxed);
+   }
+   return enabled != 0;
+}
+
+static bool
+vn_winehua_timeline_sync_enabled(void)
+{
+   static atomic_int cached = ATOMIC_VAR_INIT(-1);
+   int enabled = atomic_load_explicit(&cached, memory_order_relaxed);
+   if (enabled < 0) {
+      const char *value = os_get_option("VN_WINEHUA_TIMELINE_SYNC");
+      enabled = value && value[0] == '1' && !value[1];
+      atomic_store_explicit(&cached, enabled, memory_order_relaxed);
+   }
+   return enabled != 0;
+}
+
+static bool
+vn_winehua_timeline_blocking_wait_enabled(void)
+{
+   static atomic_int cached = ATOMIC_VAR_INIT(-1);
+   int enabled = atomic_load_explicit(&cached, memory_order_relaxed);
+   if (enabled < 0) {
+      const char *value =
+         os_get_option("VN_WINEHUA_TIMELINE_BLOCKING_WAIT");
+      enabled = value && value[0] == '1' && !value[1];
+      atomic_store_explicit(&cached, enabled, memory_order_relaxed);
+   }
+   return enabled != 0;
+}
+
+static bool
 vn_winehua_frame_assoc_trace_enabled(void)
 {
    static atomic_int cached = ATOMIC_VAR_INIT(-1);
@@ -287,6 +328,21 @@ vn_get_signal_semaphore_counter(struct vn_queue_submission *submit,
       unreachable("unexpected batch type");
    }
 }
+
+static inline bool
+vn_winehua_semaphore_timeline_valid(const struct vn_semaphore *sem)
+{
+   return sem->type == VK_SEMAPHORE_TYPE_TIMELINE &&
+          !sem->is_external &&
+          sem->payload->type == VN_SYNC_TYPE_DEVICE_ONLY &&
+          sem->winehua_timeline_sync &&
+          atomic_load_explicit(&sem->winehua_timeline_valid,
+                               memory_order_acquire);
+}
+
+static atomic_uint_fast64_t winehua_timeline_submit_count;
+static atomic_uint_fast64_t winehua_timeline_read_count;
+static atomic_uint_fast64_t winehua_timeline_wait_count;
 
 static bool
 vn_has_zink_sync_batch(struct vn_queue_submission *submit)
@@ -1056,6 +1112,97 @@ vn_queue_wsi_present(struct vn_queue_submission *submit)
    }
 }
 
+static void
+vn_winehua_submit_timeline_signals(struct vn_queue_submission *submit)
+{
+   struct vn_queue *queue = vn_queue_from_handle(submit->queue_handle);
+   struct vn_device *dev = (void *)queue->base.base.base.device;
+
+   if (!vn_winehua_timeline_sync_enabled() || !submit->batch_count)
+      return;
+
+   /* A renderer completion marker can only be appended after the complete
+    * Host vkQueueSubmit call.  Earlier batches may signal before a later
+    * batch finishes, so keep those semaphores on the exact Host RPC path. */
+   for (uint32_t i = 0; i + 1 < submit->batch_count; i++) {
+      const uint32_t signal_count = vn_get_signal_semaphore_count(submit, i);
+      for (uint32_t j = 0; j < signal_count; j++) {
+         struct vn_semaphore *sem = vn_semaphore_from_handle(
+            vn_get_signal_semaphore(submit, i, j));
+         if (sem->winehua_timeline_sync)
+            atomic_store_explicit(&sem->winehua_timeline_valid, false,
+                                  memory_order_release);
+      }
+   }
+
+   const uint32_t last = submit->batch_count - 1;
+   const uint32_t signal_count =
+      vn_get_signal_semaphore_count(submit, last);
+   if (!signal_count)
+      return;
+
+   STACK_ARRAY(struct vn_renderer_sync *, syncs, signal_count);
+   STACK_ARRAY(uint64_t, values, signal_count);
+   if (!syncs || !values) {
+      STACK_ARRAY_FINISH(syncs);
+      STACK_ARRAY_FINISH(values);
+      return;
+   }
+
+   uint32_t count = 0;
+   for (uint32_t i = 0; i < signal_count; i++) {
+      struct vn_semaphore *sem = vn_semaphore_from_handle(
+         vn_get_signal_semaphore(submit, last, i));
+      if (!vn_winehua_semaphore_timeline_valid(sem))
+         continue;
+
+      syncs[count] = sem->winehua_timeline_sync;
+      values[count] = vn_get_signal_semaphore_counter(submit, last, i);
+      count++;
+   }
+
+   if (count) {
+      struct vn_renderer_submit_batch batch = {
+         .ring_idx = submit->external_payload.ring_idx,
+         .syncs = syncs,
+         .sync_values = values,
+         .sync_count = count,
+      };
+      uint32_t local_data[8];
+      struct vn_cs_encoder local_enc =
+         VN_CS_ENCODER_INITIALIZER_LOCAL(local_data, sizeof(local_data));
+      if (submit->external_payload.ring_seqno_valid) {
+         const uint64_t ring_id = vn_ring_get_id(dev->primary_ring);
+         vn_encode_vkWaitRingSeqnoMESA(
+            &local_enc, 0, ring_id, submit->external_payload.ring_seqno);
+         batch.cs_data = local_data;
+         batch.cs_size = vn_cs_encoder_get_len(&local_enc);
+      }
+
+      const struct vn_renderer_submit renderer_submit = {
+         .batches = &batch,
+         .batch_count = 1,
+      };
+      const VkResult result =
+         vn_renderer_submit(dev->renderer, &renderer_submit);
+      if (result == VK_SUCCESS) {
+         atomic_fetch_add_explicit(&winehua_timeline_submit_count, count,
+                                   memory_order_relaxed);
+      } else {
+         for (uint32_t i = 0; i < signal_count; i++) {
+            struct vn_semaphore *sem = vn_semaphore_from_handle(
+               vn_get_signal_semaphore(submit, last, i));
+            if (sem->winehua_timeline_sync)
+               atomic_store_explicit(&sem->winehua_timeline_valid, false,
+                                     memory_order_release);
+         }
+      }
+   }
+
+   STACK_ARRAY_FINISH(syncs);
+   STACK_ARRAY_FINISH(values);
+}
+
 static VkResult
 vn_queue_submit(struct vn_queue_submission *submit)
 {
@@ -1173,6 +1320,8 @@ vn_queue_submit(struct vn_queue_submission *submit)
          }
       }
    }
+
+   vn_winehua_submit_timeline_signals(submit);
 
    vn_queue_wsi_present(submit);
 
@@ -2450,6 +2599,19 @@ vn_CreateSemaphore(VkDevice device,
          goto out_payloads_fini;
    }
 
+   atomic_init(&sem->winehua_timeline_valid, false);
+   if (sem->type == VK_SEMAPHORE_TYPE_TIMELINE && !sem->is_external &&
+       !sem->feedback.slot && vn_winehua_timeline_sync_enabled()) {
+      result = vn_renderer_sync_create(dev->renderer, initial_val, 0,
+                                       &sem->winehua_timeline_sync);
+      if (result == VK_SUCCESS) {
+         atomic_store_explicit(&sem->winehua_timeline_valid, true,
+                               memory_order_release);
+      } else {
+         sem->winehua_timeline_sync = NULL;
+      }
+   }
+
    VkSemaphore sem_handle = vn_semaphore_to_handle(sem);
    vn_async_vkCreateSemaphore(dev->primary_ring, device, pCreateInfo, NULL,
                               &sem_handle);
@@ -2484,6 +2646,9 @@ vn_DestroySemaphore(VkDevice device,
 
    vn_async_vkDestroySemaphore(dev->primary_ring, device, semaphore, NULL);
 
+   if (sem->winehua_timeline_sync)
+      vn_renderer_sync_destroy(dev->renderer, sem->winehua_timeline_sync);
+
    if (sem->type == VK_SEMAPHORE_TYPE_TIMELINE)
       vn_semaphore_feedback_fini(dev, sem);
 
@@ -2504,6 +2669,24 @@ vn_GetSemaphoreCounterValue(VkDevice device,
    ASSERTED struct vn_sync_payload *payload = sem->payload;
 
    assert(payload->type == VN_SYNC_TYPE_DEVICE_ONLY);
+
+   if (vn_winehua_semaphore_timeline_valid(sem)) {
+      VkResult result = vn_renderer_sync_read(
+         dev->renderer, sem->winehua_timeline_sync, pValue);
+      if (result == VK_SUCCESS) {
+         const uint64_t count = atomic_fetch_add_explicit(
+            &winehua_timeline_read_count, 1, memory_order_relaxed) + 1;
+         if (count == 1 || !(count % 600))
+            vn_log(dev->instance,
+                   "WineHuaTimelineSync: reads=%" PRIu64
+                   " queue_signals=%" PRIuFAST64,
+                   count, atomic_load_explicit(&winehua_timeline_submit_count,
+                                               memory_order_relaxed));
+         return VK_SUCCESS;
+      }
+      atomic_store_explicit(&sem->winehua_timeline_valid, false,
+                            memory_order_release);
+   }
 
    if (sem->feedback.slot) {
       simple_mtx_lock(&sem->feedback.async_wait_mtx);
@@ -2573,7 +2756,40 @@ vn_SignalSemaphore(VkDevice device, const VkSemaphoreSignalInfo *pSignalInfo)
    struct vn_semaphore *sem =
       vn_semaphore_from_handle(pSignalInfo->semaphore);
 
-   vn_async_vkSignalSemaphore(dev->primary_ring, device, pSignalInfo);
+   if (vn_winehua_semaphore_timeline_valid(sem)) {
+      struct vn_ring_submit_command ring_submit;
+      vn_submit_vkSignalSemaphore(dev->primary_ring, 0, device, pSignalInfo,
+                                  &ring_submit);
+      if (ring_submit.ring_seqno_valid) {
+         struct vn_renderer_sync *sync = sem->winehua_timeline_sync;
+         struct vn_renderer_submit_batch batch = {
+            .ring_idx = 0,
+            .syncs = &sync,
+            .sync_values = &pSignalInfo->value,
+            .sync_count = 1,
+         };
+         uint32_t local_data[8];
+         struct vn_cs_encoder local_enc =
+            VN_CS_ENCODER_INITIALIZER_LOCAL(local_data, sizeof(local_data));
+         const uint64_t ring_id = vn_ring_get_id(dev->primary_ring);
+         vn_encode_vkWaitRingSeqnoMESA(&local_enc, 0, ring_id,
+                                       ring_submit.ring_seqno);
+         batch.cs_data = local_data;
+         batch.cs_size = vn_cs_encoder_get_len(&local_enc);
+         const struct vn_renderer_submit submit = {
+            .batches = &batch,
+            .batch_count = 1,
+         };
+         if (vn_renderer_submit(dev->renderer, &submit) != VK_SUCCESS)
+            atomic_store_explicit(&sem->winehua_timeline_valid, false,
+                                  memory_order_release);
+      } else {
+         atomic_store_explicit(&sem->winehua_timeline_valid, false,
+                               memory_order_release);
+      }
+   } else {
+      vn_async_vkSignalSemaphore(dev->primary_ring, device, pSignalInfo);
+   }
 
    if (sem->feedback.slot) {
       simple_mtx_lock(&sem->feedback.async_wait_mtx);
@@ -2627,6 +2843,74 @@ vn_remove_signaled_semaphores(VkDevice device,
    return cur ? VK_NOT_READY : VK_SUCCESS;
 }
 
+static VkResult
+vn_winehua_wait_timeline_semaphores(struct vn_device *dev,
+                                    const VkSemaphoreWaitInfo *wait_info,
+                                    uint64_t timeout,
+                                    bool *used)
+{
+   *used = false;
+   const uint32_t count = wait_info->semaphoreCount;
+   if (!vn_winehua_timeline_sync_enabled() ||
+       !vn_winehua_timeline_blocking_wait_enabled() ||
+       !count)
+      return VK_NOT_READY;
+
+   STACK_ARRAY(struct vn_renderer_sync *, syncs, count);
+   if (!syncs)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   for (uint32_t i = 0; i < count; i++) {
+      struct vn_semaphore *sem =
+         vn_semaphore_from_handle(wait_info->pSemaphores[i]);
+      if (!vn_winehua_semaphore_timeline_valid(sem)) {
+         STACK_ARRAY_FINISH(syncs);
+         return VK_NOT_READY;
+      }
+      syncs[i] = sem->winehua_timeline_sync;
+   }
+
+   /* vtest dispatches sync waits in command-stream order.  A long wait can
+    * therefore sit in front of the CPU signal or queue marker that satisfies
+    * it.  One-millisecond slices preserve Vulkan's full timeout while giving
+    * the renderer a chance to dispatch later signaling commands. */
+   const uint64_t slice_ns = 1000000ull;
+   const int64_t abs_timeout = os_time_get_absolute_timeout(timeout);
+   struct vn_renderer_wait wait = {
+      .wait_any = wait_info->flags & VK_SEMAPHORE_WAIT_ANY_BIT,
+      .timeout = timeout > slice_ns ? slice_ns : timeout,
+      .syncs = syncs,
+      .sync_values = wait_info->pValues,
+      .sync_count = count,
+   };
+
+   VkResult result;
+   for (;;) {
+      result = vn_renderer_wait(dev->renderer, &wait);
+      if (result != VK_TIMEOUT || !timeout)
+         break;
+
+      const int64_t now = os_time_get_nano();
+      if (now >= abs_timeout)
+         break;
+
+      const uint64_t remaining = (uint64_t)(abs_timeout - now);
+      wait.timeout = remaining > slice_ns ? slice_ns : remaining;
+      thrd_yield();
+   }
+   STACK_ARRAY_FINISH(syncs);
+
+   if (result == VK_SUCCESS || result == VK_TIMEOUT) {
+      *used = true;
+      const uint64_t waits = atomic_fetch_add_explicit(
+         &winehua_timeline_wait_count, 1, memory_order_relaxed) + 1;
+      if (waits == 1 || !(waits % 120))
+         vn_log(dev->instance, "WineHuaTimelineSync: waits=%" PRIu64,
+                waits);
+   }
+   return result;
+}
+
 VkResult
 vn_WaitSemaphores(VkDevice device,
                   const VkSemaphoreWaitInfo *pWaitInfo,
@@ -2635,8 +2919,64 @@ vn_WaitSemaphores(VkDevice device,
    VN_TRACE_FUNC();
    struct vn_device *dev = vn_device_from_handle(device);
 
+   /* Prefer the renderer-side timeline mirror when every semaphore in the
+    * wait has one. This channel is independent of the primary Venus ring,
+    * so a long GPU wait does not block later queue submissions or CPU
+    * signals. Unsupported/external semaphores retain the exact old path. */
+   bool used_timeline = false;
+   VkResult result = vn_winehua_wait_timeline_semaphores(
+      dev, pWaitInfo, timeout, &used_timeline);
+   if (used_timeline)
+      return vn_result(dev->instance, result);
+   if (result < 0)
+      return vn_result(dev->instance, result);
+
    const int64_t abs_timeout = os_time_get_absolute_timeout(timeout);
-   VkResult result = VK_NOT_READY;
+
+   /* Timeline semaphore feedback cannot be consumed through the OHOS vtest
+    * shadow mapping, so the upstream path degenerates into repeated
+    * synchronous vkGetSemaphoreCounterValue replies.  For device-only
+    * semaphores, let the renderer perform one real wait instead.  Bound the
+    * direct call so a CPU signal encoded behind the wait on the single ring
+    * cannot deadlock the renderer indefinitely; after the watchdog expires,
+    * retain the original polling path and its original absolute deadline. */
+   if (vn_winehua_direct_semaphore_wait_enabled() &&
+       pWaitInfo->semaphoreCount && timeout) {
+      bool all_device_only = true;
+      for (uint32_t i = 0; i < pWaitInfo->semaphoreCount; i++) {
+         const struct vn_semaphore *sem =
+            vn_semaphore_from_handle(pWaitInfo->pSemaphores[i]);
+         if (sem->payload->type != VN_SYNC_TYPE_DEVICE_ONLY) {
+            all_device_only = false;
+            break;
+         }
+      }
+
+      if (all_device_only) {
+         static atomic_bool logged = ATOMIC_VAR_INIT(false);
+         if (!atomic_exchange_explicit(&logged, true,
+                                       memory_order_relaxed))
+            vn_log(dev->instance,
+                   "WineHua direct timeline semaphore wait enabled");
+
+         const uint64_t watchdog_ns = 3000000000ull;
+         const uint64_t direct_timeout =
+            timeout > watchdog_ns ? watchdog_ns : timeout;
+         const VkResult direct_result = vn_call_vkWaitSemaphores(
+            dev->primary_ring, device, pWaitInfo, direct_timeout);
+         if (direct_result != VK_TIMEOUT || timeout <= watchdog_ns)
+            return vn_result(dev->instance, direct_result);
+
+         static atomic_bool fallback_logged = ATOMIC_VAR_INIT(false);
+         if (!atomic_exchange_explicit(&fallback_logged, true,
+                                       memory_order_relaxed))
+            vn_log(dev->instance,
+                   "WineHua direct timeline semaphore wait watchdog; "
+                   "falling back to polling");
+      }
+   }
+
+   result = VK_NOT_READY;
    if (pWaitInfo->semaphoreCount > 1 &&
        !(pWaitInfo->flags & VK_SEMAPHORE_WAIT_ANY_BIT)) {
       uint32_t semaphore_count = pWaitInfo->semaphoreCount;

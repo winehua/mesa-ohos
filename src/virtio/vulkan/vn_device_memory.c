@@ -30,6 +30,15 @@
 #define VN_WINEHUA_PERSISTENT_FLUSH_BATCH_SIZE 256
 #define VN_WINEHUA_PERSISTENT_RANGE_LIMIT 1024
 
+struct vn_winehua_persistent_flush_snapshot {
+   VkMappedMemoryRange range;
+   struct vn_renderer_bo *bo;
+   struct vn_device_memory *mem;
+   uint64_t memory_id;
+   uint64_t generation;
+   bool whole_map;
+};
+
 static bool
 vn_winehua_async_memory_flush_enabled(void)
 {
@@ -85,6 +94,20 @@ vn_winehua_persistent_map_verbose_enabled(void)
    return enabled != 0;
 }
 
+static bool
+vn_winehua_consume_persistent_flush_ranges_enabled(void)
+{
+   static atomic_int cached = ATOMIC_VAR_INIT(-1);
+   int enabled = atomic_load_explicit(&cached, memory_order_relaxed);
+   if (enabled < 0) {
+      const char *value =
+         os_get_option("VN_WINEHUA_CONSUME_PERSISTENT_FLUSH_RANGES");
+      enabled = value && value[0] == '1' && !value[1];
+      atomic_store_explicit(&cached, enabled, memory_order_relaxed);
+   }
+   return enabled != 0;
+}
+
 static const char *
 vn_winehua_smoke_label(const char *name)
 {
@@ -104,8 +127,7 @@ vn_device_memory_record_persistent_flush_range(
                          memory_order_relaxed);
 
    simple_mtx_lock(&dev->mapped_memory_mutex);
-   if (!mem->mapped || mem->persistent_flush_range_overflow ||
-       mem->map_end <= mem->map_offset) {
+   if (!mem->mapped || mem->map_end <= mem->map_offset) {
       simple_mtx_unlock(&dev->mapped_memory_mutex);
       return;
    }
@@ -115,6 +137,12 @@ vn_device_memory_record_persistent_flush_range(
    if (size != VK_WHOLE_SIZE && begin < end && size < end - begin)
       end = begin + size;
    if (begin >= end) {
+      simple_mtx_unlock(&dev->mapped_memory_mutex);
+      return;
+   }
+
+   mem->persistent_flush_generation++;
+   if (mem->persistent_flush_range_overflow) {
       simple_mtx_unlock(&dev->mapped_memory_mutex);
       return;
    }
@@ -168,6 +196,29 @@ vn_device_memory_record_persistent_flush_range(
 }
 
 static VkResult
+vn_device_memory_submit_flush_ranges(
+   struct vn_device *dev, VkDevice device, uint32_t memory_range_count,
+   const VkMappedMemoryRange *memory_ranges)
+{
+   const char *remote_sync = os_get_option("VN_WINEHUA_REMOTE_MEMORY_SYNC");
+   if (remote_sync && remote_sync[0] == '1' &&
+       vn_winehua_async_memory_flush_enabled()) {
+      struct vn_ring_submit_command submit;
+      vn_submit_vkFlushMappedMemoryRanges(dev->primary_ring, 0, device,
+                                          memory_range_count, memory_ranges,
+                                          &submit);
+      return submit.ring_seqno_valid ? VK_SUCCESS
+                                     : VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   if (remote_sync && remote_sync[0] == '1')
+      return vn_call_vkFlushMappedMemoryRanges(dev->primary_ring, device,
+                                               memory_range_count,
+                                               memory_ranges);
+
+   return VK_SUCCESS;
+}
+
+static VkResult
 vn_device_memory_flush_ranges(struct vn_device *dev, VkDevice device,
                               uint32_t memory_range_count,
                               const VkMappedMemoryRange *memory_ranges,
@@ -188,22 +239,8 @@ vn_device_memory_flush_ranges(struct vn_device *dev, VkDevice device,
       vn_renderer_bo_flush(dev->renderer, mem->base_bo, range->offset, size);
    }
 
-   const char *remote_sync = os_get_option("VN_WINEHUA_REMOTE_MEMORY_SYNC");
-   if (remote_sync && remote_sync[0] == '1' &&
-       vn_winehua_async_memory_flush_enabled()) {
-      struct vn_ring_submit_command submit;
-      vn_submit_vkFlushMappedMemoryRanges(dev->primary_ring, 0, device,
-                                          memory_range_count, memory_ranges,
-                                          &submit);
-      return submit.ring_seqno_valid ? VK_SUCCESS
-                                     : VK_ERROR_OUT_OF_HOST_MEMORY;
-   }
-   if (remote_sync && remote_sync[0] == '1')
-      return vn_call_vkFlushMappedMemoryRanges(dev->primary_ring, device,
-                                               memory_range_count,
-                                               memory_ranges);
-
-   return VK_SUCCESS;
+   return vn_device_memory_submit_flush_ranges(
+      dev, device, memory_range_count, memory_ranges);
 }
 
 static void
@@ -217,6 +254,7 @@ vn_device_memory_untrack_mapping(struct vn_device *dev,
    }
    mem->map_offset = 0;
    mem->map_end = 0;
+   mem->persistent_flush_generation++;
    atomic_store_explicit(&mem->persistent_map_write_seen, false,
                          memory_order_relaxed);
    free(mem->persistent_flush_ranges);
@@ -225,6 +263,218 @@ vn_device_memory_untrack_mapping(struct vn_device *dev,
    mem->persistent_flush_range_capacity = 0;
    mem->persistent_flush_range_overflow = false;
    simple_mtx_unlock(&dev->mapped_memory_mutex);
+}
+
+static void
+vn_device_memory_flush_consumed_persistent_ranges(struct vn_device *dev)
+{
+   const bool trace = vn_winehua_persistent_map_trace_enabled();
+   const bool verbose = trace &&
+      vn_winehua_persistent_map_verbose_enabled();
+   const char *run_id = trace
+      ? vn_winehua_smoke_label("WINEHUA_SMOKE_RUN_ID") : "";
+   const char *test_id = trace
+      ? vn_winehua_smoke_label("WINEHUA_SMOKE_TEST_ID") : "";
+   const int64_t begin_ns = trace ? os_time_get_nano() : 0;
+   struct vn_winehua_persistent_flush_snapshot *snapshots = NULL;
+   VkMappedMemoryRange ranges[VN_WINEHUA_PERSISTENT_FLUSH_BATCH_SIZE];
+   VkDevice device = vn_device_to_handle(dev);
+   size_t snapshot_count = 0;
+   uint32_t allocation_count = 0;
+   uint32_t whole_map_count = 0;
+   uint32_t batch_count = 0;
+   uint64_t flush_bytes = 0;
+   bool all_flushes_succeeded = true;
+   static atomic_uint_fast64_t submit_count = ATOMIC_VAR_INIT(0);
+   static atomic_uint_fast64_t cumulative_ranges = ATOMIC_VAR_INIT(0);
+   static atomic_uint_fast64_t cumulative_bytes = ATOMIC_VAR_INIT(0);
+   static atomic_uint_fast64_t cumulative_batches = ATOMIC_VAR_INIT(0);
+   static atomic_uint_fast64_t cumulative_whole_maps = ATOMIC_VAR_INIT(0);
+
+   /* Exact mode records the allocations consumed by this queue submission.
+    * Snapshot only bookkeeping and BO references under the global map lock;
+    * the potentially blocking shadow copy and primary-ring submission happen
+    * after releasing it. A generation check prevents a concurrent explicit
+    * flush from being cleared by an older snapshot. */
+   simple_mtx_lock(&dev->mapped_memory_mutex);
+   list_for_each_entry(struct vn_device_memory, mem, &dev->mapped_memories,
+                       mapped_head) {
+      const struct vk_device_memory *mem_vk = &mem->base.base;
+      const VkMemoryPropertyFlags property_flags =
+         dev->physical_device->memory_properties
+            .memoryTypes[mem_vk->memory_type_index]
+            .propertyFlags;
+      if (!mem->base_bo ||
+          !(property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ||
+          !atomic_load_explicit(&mem->persistent_map_write_seen,
+                                memory_order_relaxed) ||
+          mem->map_end <= mem->map_offset ||
+          (!mem->persistent_flush_range_overflow &&
+           !mem->persistent_flush_range_count))
+         continue;
+
+      const size_t mem_range_count = mem->persistent_flush_range_overflow
+         ? 1 : mem->persistent_flush_range_count;
+      if (mem_range_count > UINT32_MAX - snapshot_count) {
+         vn_log(dev->instance,
+                "WineHua persistent-map snapshot range count overflow");
+         simple_mtx_unlock(&dev->mapped_memory_mutex);
+         return;
+      }
+      snapshot_count += mem_range_count;
+   }
+
+   if (!snapshot_count) {
+      simple_mtx_unlock(&dev->mapped_memory_mutex);
+      return;
+   }
+
+   snapshots = calloc(snapshot_count, sizeof(*snapshots));
+   if (!snapshots) {
+      vn_log(dev->instance,
+             "WineHua persistent-map snapshot allocation failed: ranges=%zu",
+             snapshot_count);
+      simple_mtx_unlock(&dev->mapped_memory_mutex);
+      return;
+   }
+
+   size_t snapshot_index = 0;
+   list_for_each_entry(struct vn_device_memory, mem, &dev->mapped_memories,
+                       mapped_head) {
+      const struct vk_device_memory *mem_vk = &mem->base.base;
+      const VkMemoryPropertyFlags property_flags =
+         dev->physical_device->memory_properties
+            .memoryTypes[mem_vk->memory_type_index]
+            .propertyFlags;
+      if (!mem->base_bo ||
+          !(property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ||
+          !atomic_load_explicit(&mem->persistent_map_write_seen,
+                                memory_order_relaxed) ||
+          mem->map_end <= mem->map_offset ||
+          (!mem->persistent_flush_range_overflow &&
+           !mem->persistent_flush_range_count))
+         continue;
+
+      const bool whole_map = mem->persistent_flush_range_overflow;
+      const uint32_t mem_range_count = whole_map
+         ? 1 : mem->persistent_flush_range_count;
+      allocation_count++;
+      whole_map_count += whole_map;
+      for (uint32_t i = 0; i < mem_range_count; i++) {
+         const VkDeviceSize offset = whole_map
+            ? mem->map_offset : mem->persistent_flush_ranges[i].offset;
+         const VkDeviceSize end = whole_map
+            ? mem->map_end : mem->persistent_flush_ranges[i].end;
+         struct vn_winehua_persistent_flush_snapshot *snapshot =
+            &snapshots[snapshot_index++];
+         snapshot->range = (VkMappedMemoryRange) {
+            .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+            .memory = vn_device_memory_to_handle(mem),
+            .offset = offset,
+            .size = end - offset,
+         };
+         snapshot->bo = vn_renderer_bo_ref(dev->renderer, mem->base_bo);
+         snapshot->mem = mem;
+         snapshot->memory_id = mem->base.id;
+         snapshot->generation = mem->persistent_flush_generation;
+         snapshot->whole_map = whole_map;
+         flush_bytes += end - offset;
+
+         if (verbose)
+            vn_log(dev->instance,
+                   "WineHua persistent-map runId=%.80s testId=%.80s"
+                   " snapshot: memory=%" PRIu64
+                   " offset=%" PRIu64 " size=%" PRIu64
+                   " fallback=%u generation=%" PRIu64,
+                   run_id, test_id, mem->base.id, offset, end - offset,
+                   (unsigned)whole_map, mem->persistent_flush_generation);
+      }
+   }
+   assert(snapshot_index == snapshot_count);
+   simple_mtx_unlock(&dev->mapped_memory_mutex);
+
+   for (size_t first = 0; first < snapshot_count;
+        first += VN_WINEHUA_PERSISTENT_FLUSH_BATCH_SIZE) {
+      const uint32_t range_count = MIN2(
+         snapshot_count - first,
+         (size_t)VN_WINEHUA_PERSISTENT_FLUSH_BATCH_SIZE);
+      for (uint32_t i = 0; i < range_count; i++) {
+         const struct vn_winehua_persistent_flush_snapshot *snapshot =
+            &snapshots[first + i];
+         ranges[i] = snapshot->range;
+         vn_renderer_bo_flush(dev->renderer, snapshot->bo,
+                              snapshot->range.offset,
+                              snapshot->range.size);
+      }
+
+      const VkResult result = vn_device_memory_submit_flush_ranges(
+         dev, device, range_count, ranges);
+      if (result != VK_SUCCESS) {
+         all_flushes_succeeded = false;
+         vn_log(dev->instance,
+                "WineHua persistent-map snapshot flush failed: "
+                "ranges=%u result=%d", range_count, result);
+      }
+      batch_count++;
+   }
+
+   if (all_flushes_succeeded) {
+      simple_mtx_lock(&dev->mapped_memory_mutex);
+      list_for_each_entry(struct vn_device_memory, mem, &dev->mapped_memories,
+                          mapped_head) {
+         for (size_t i = 0; i < snapshot_count; i++) {
+            const struct vn_winehua_persistent_flush_snapshot *snapshot =
+               &snapshots[i];
+            if (snapshot->mem != mem || snapshot->memory_id != mem->base.id)
+               continue;
+            if (snapshot->generation == mem->persistent_flush_generation) {
+               mem->persistent_flush_range_count = 0;
+               mem->persistent_flush_range_overflow = false;
+               atomic_store_explicit(&mem->persistent_map_write_seen, false,
+                                     memory_order_relaxed);
+            }
+            break;
+         }
+      }
+      simple_mtx_unlock(&dev->mapped_memory_mutex);
+   }
+
+   for (size_t i = 0; i < snapshot_count; i++)
+      vn_renderer_bo_unref(dev->renderer, snapshots[i].bo);
+
+   if (trace) {
+      const uint64_t elapsed_us =
+         (uint64_t)(os_time_get_nano() - begin_ns) / 1000;
+      const uint64_t submit = atomic_fetch_add_explicit(
+         &submit_count, 1, memory_order_relaxed) + 1;
+      const uint64_t total_ranges = atomic_fetch_add_explicit(
+         &cumulative_ranges, snapshot_count, memory_order_relaxed) +
+         snapshot_count;
+      const uint64_t total_bytes = atomic_fetch_add_explicit(
+         &cumulative_bytes, flush_bytes, memory_order_relaxed) + flush_bytes;
+      const uint64_t total_batches = atomic_fetch_add_explicit(
+         &cumulative_batches, batch_count, memory_order_relaxed) + batch_count;
+      const uint64_t total_whole_maps = atomic_fetch_add_explicit(
+         &cumulative_whole_maps, whole_map_count, memory_order_relaxed) +
+         whole_map_count;
+      if (submit <= 17 || submit == 64 || submit == 1024 ||
+          submit == 1025 || !(submit % 120))
+         vn_log(dev->instance,
+                "WineHua persistent-map runId=%.80s testId=%.80s"
+                " submit=%" PRIu64
+                " allocations=%u replayRanges=%zu replayBytes=%" PRIu64
+                " batches=%u wholeMaps=%u guestReplayUs=%" PRIu64
+                " consumed=%u locklessSnapshot=1"
+                " cumulativeRanges=%" PRIu64 " cumulativeBytes=%" PRIu64
+                " cumulativeBatches=%" PRIu64
+                " cumulativeWholeMaps=%" PRIu64,
+                run_id, test_id, submit, allocation_count,
+                snapshot_count, flush_bytes, batch_count, whole_map_count,
+                elapsed_us, (unsigned)all_flushes_succeeded,
+                total_ranges, total_bytes, total_batches, total_whole_maps);
+   }
+
+   free(snapshots);
 }
 
 void
@@ -241,6 +491,13 @@ vn_device_memory_flush_persistent_mappings(struct vn_device *dev)
    uint32_t allocation_count = 0;
    uint32_t whole_map_count = 0;
    uint64_t flush_bytes = 0;
+   bool all_flushes_succeeded = true;
+   const bool consume_ranges =
+      vn_winehua_consume_persistent_flush_ranges_enabled();
+   if (consume_ranges) {
+      vn_device_memory_flush_consumed_persistent_ranges(dev);
+      return;
+   }
    const bool trace = vn_winehua_persistent_map_trace_enabled();
    const bool verbose = trace &&
       vn_winehua_persistent_map_verbose_enabled();
@@ -272,6 +529,14 @@ vn_device_memory_flush_persistent_mappings(struct vn_device *dev)
           !atomic_load_explicit(&mem->persistent_map_write_seen,
                                 memory_order_relaxed) ||
           mem->map_end <= mem->map_offset)
+         continue;
+
+      /* Exact-range mode relies on an explicit vkFlushMappedMemoryRanges call
+       * before each D3D12 ExecuteCommandLists. Once a recorded range has been
+       * replayed, a later fence-only or bookkeeping submit must not fall back
+       * to the complete persistent mapping. */
+      if (consume_ranges && !mem->persistent_flush_range_overflow &&
+          !mem->persistent_flush_range_count)
          continue;
 
       if (trace)
@@ -309,6 +574,7 @@ vn_device_memory_flush_persistent_mappings(struct vn_device *dev)
             const VkResult result = vn_device_memory_flush_ranges(
                dev, device, range_count, ranges, false);
             if (result != VK_SUCCESS) {
+               all_flushes_succeeded = false;
                vn_log(dev->instance,
                       "WineHua persistent-map flush batch failed: "
                       "ranges=%u result=%d", range_count, result);
@@ -323,11 +589,25 @@ vn_device_memory_flush_persistent_mappings(struct vn_device *dev)
       const VkResult result = vn_device_memory_flush_ranges(
          dev, device, range_count, ranges, false);
       if (result != VK_SUCCESS) {
+         all_flushes_succeeded = false;
          vn_log(dev->instance,
                 "WineHua persistent-map flush batch failed: "
                 "ranges=%u result=%d", range_count, result);
       }
       batch_count++;
+   }
+
+   if (consume_ranges && all_flushes_succeeded) {
+      list_for_each_entry(struct vn_device_memory, mem, &dev->mapped_memories,
+                          mapped_head) {
+         if (!mem->persistent_flush_range_count &&
+             !mem->persistent_flush_range_overflow)
+            continue;
+         mem->persistent_flush_range_count = 0;
+         mem->persistent_flush_range_overflow = false;
+         atomic_store_explicit(&mem->persistent_map_write_seen, false,
+                               memory_order_relaxed);
+      }
    }
    simple_mtx_unlock(&dev->mapped_memory_mutex);
 
@@ -352,11 +632,13 @@ vn_device_memory_flush_persistent_mappings(struct vn_device *dev)
                 " submit=%" PRIu64
                 " allocations=%u replayRanges=%u replayBytes=%" PRIu64
                 " batches=%u wholeMaps=%u guestReplayUs=%" PRIu64
+                " consumed=%u"
                 " cumulativeRanges=%" PRIu64 " cumulativeBytes=%" PRIu64
                 " cumulativeBatches=%" PRIu64 " cumulativeWholeMaps=%" PRIu64,
                 run_id, test_id, submit, allocation_count,
                 flush_count, flush_bytes, batch_count, whole_map_count,
-                elapsed_us, total_ranges, total_bytes, total_batches,
+                elapsed_us, (unsigned)(consume_ranges && all_flushes_succeeded),
+                total_ranges, total_bytes, total_batches,
                 total_whole_maps);
    }
 }
@@ -722,6 +1004,7 @@ vn_AllocateMemory(VkDevice device,
    mem->persistent_flush_range_count = 0;
    mem->persistent_flush_range_capacity = 0;
    mem->persistent_flush_range_overflow = false;
+   mem->persistent_flush_generation = 0;
    vn_object_set_id(mem, vn_get_next_obj_id(), VK_OBJECT_TYPE_DEVICE_MEMORY);
 
    VkResult result;

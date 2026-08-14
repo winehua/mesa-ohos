@@ -146,6 +146,13 @@ struct vn_semaphore {
 
    bool is_external;
    struct vn_sync_payload_external external_payload;
+
+   /* Optional WineHua timeline mirror.  Unlike Venus feedback memory, the
+    * vtest renderer sync is shared by protocol rather than by mapping, so it
+    * remains coherent when Guest and Host Vulkan memory use separate shadow
+    * allocations. */
+   struct vn_renderer_sync *winehua_timeline_sync;
+   atomic_bool winehua_timeline_valid;
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(vn_semaphore,
                                base.base,
