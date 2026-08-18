@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -1361,7 +1362,10 @@ vn_winehua_present(VkQueue queue_handle,
          (drain_perf || vtest_winehua_present_trace_enabled())
             ? os_time_get_nano() : 0;
       vn_ring_roundtrip(dev->primary_ring);
-      vn_ring_wait_all(dev->primary_ring);
+      const char *roundtrip_only =
+         os_get_option("VN_WINEHUA_PRESENT_ROUNDTRIP_ONLY");
+      if (!roundtrip_only || strcmp(roundtrip_only, "1") != 0)
+         vn_ring_wait_all(dev->primary_ring);
       if (drain_start_ns) {
          const int64_t drain_end_ns = os_time_get_nano();
          const uint64_t drain_us = drain_end_ns > drain_start_ns
