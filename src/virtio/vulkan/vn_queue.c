@@ -27,8 +27,11 @@
 #include "vn_renderer.h"
 #include "vn_ring.h"
 #include "vn_wsi.h"
+#include "vn_winehua_dx12_trace.h"
 
 #include <unistd.h>
+
+struct vn_winehua_dx12_tls vn_winehua_dx12_acc;
 
 /* queue commands */
 
@@ -1104,7 +1107,10 @@ vn_queue_submit(struct vn_queue_submission *submit)
     * a persistently mapped coherent Guest allocation. Publish those ranges
     * before the renderer consumes command buffers that reference them. This
     * path is opt-in and currently enabled only for the VKD3D profile. */
+   vn_winehua_dx12_note_start();
    vn_device_memory_flush_persistent_mappings(dev);
+   const int64_t submit_start_ns = vn_winehua_dx12_trace_enabled()
+      ? os_time_get_nano() : 0;
 
    /* skip no-op submit */
    if (!submit->batch_count && submit->fence_handle == VK_NULL_HANDLE)
@@ -1144,6 +1150,14 @@ vn_queue_submit(struct vn_queue_submission *submit)
       submit->external_payload.ring_seqno = ring_submit.ring_seqno;
       queue->winehua_last_submit_seqno = ring_submit.ring_seqno;
       queue->winehua_last_submit_seqno_valid = true;
+   }
+
+   if (vn_winehua_dx12_trace_enabled() && submit_start_ns) {
+      const int64_t submit_end_ns = os_time_get_nano();
+      vn_winehua_dx12_add(&vn_winehua_dx12_acc.submit_us,
+                          vn_winehua_dx12_ns_to_us(submit_start_ns,
+                                                   submit_end_ns));
+      vn_winehua_dx12_add(&vn_winehua_dx12_acc.submit_count, 1);
    }
 
    /* If external fence, track the submission's ring_idx to facilitate
@@ -2042,6 +2056,25 @@ out:
    return result;
 }
 
+static uint64_t
+vn_winehua_dx12_elapsed_us(int64_t wait_start_ns)
+{
+   if (!wait_start_ns)
+      return 0;
+   const int64_t wait_end_ns = os_time_get_nano();
+   return wait_end_ns > wait_start_ns
+      ? (uint64_t)(wait_end_ns - wait_start_ns) / 1000ull : 0;
+}
+
+static void
+vn_winehua_dx12_after_fence_wait(uint64_t elapsed_us)
+{
+   if (!vn_winehua_dx12_trace_enabled())
+      return;
+   vn_winehua_dx12_add(&vn_winehua_dx12_acc.fence_wait_us, elapsed_us);
+   vn_winehua_dx12_emit_and_reset();
+}
+
 VkResult
 vn_WaitForFences(VkDevice device,
                  uint32_t fenceCount,
@@ -2053,7 +2086,9 @@ vn_WaitForFences(VkDevice device,
    struct vn_device *dev = vn_device_from_handle(device);
    const bool perf_summary =
       vn_ring_perf_summary_enabled(dev->primary_ring);
-   const int64_t wait_start_ns = perf_summary ? os_time_get_nano() : 0;
+   const bool dx12_trace = vn_winehua_dx12_trace_enabled();
+   const int64_t wait_start_ns =
+      (perf_summary || dx12_trace) ? os_time_get_nano() : 0;
    const int64_t abs_timeout = os_time_get_absolute_timeout(timeout);
    uint32_t status_call_count = 0;
 
@@ -2068,10 +2103,8 @@ vn_WaitForFences(VkDevice device,
          dev, device, fenceCount, pFences, waitAll, abs_timeout,
          &event_status_calls, &used_event);
       if (used_event) {
+         const uint64_t elapsed_us = vn_winehua_dx12_elapsed_us(wait_start_ns);
          if (perf_summary) {
-            const int64_t wait_end_ns = os_time_get_nano();
-            const uint64_t elapsed_us = wait_end_ns > wait_start_ns
-               ? (uint64_t)(wait_end_ns - wait_start_ns) / 1000 : 0;
             vn_winehua_record_fence_wait(dev, false, true,
                                          event_status_calls, event_result,
                                          elapsed_us);
@@ -2080,6 +2113,7 @@ vn_WaitForFences(VkDevice device,
                    "WineHua fence wait mode=event failed result=%d",
                    event_result);
          }
+         vn_winehua_dx12_after_fence_wait(elapsed_us);
          return vn_result(dev->instance, event_result);
       }
    }
@@ -2099,16 +2133,15 @@ vn_WaitForFences(VkDevice device,
    if (all_device_only && fenceCount) {
       const VkResult result = vn_call_vkWaitForFences(
          dev->primary_ring, device, fenceCount, pFences, waitAll, timeout);
+      const uint64_t elapsed_us = vn_winehua_dx12_elapsed_us(wait_start_ns);
       if (perf_summary) {
-         const int64_t wait_end_ns = os_time_get_nano();
-         const uint64_t elapsed_us = wait_end_ns > wait_start_ns
-            ? (uint64_t)(wait_end_ns - wait_start_ns) / 1000 : 0;
          vn_winehua_record_fence_wait(dev, true, false, 0, result,
                                       elapsed_us);
       } else if (result < 0) {
          vn_log(dev->instance,
                 "WineHua fence wait mode=direct failed result=%d", result);
       }
+      vn_winehua_dx12_after_fence_wait(elapsed_us);
       return vn_result(dev->instance, result);
    }
 
@@ -2140,10 +2173,8 @@ vn_WaitForFences(VkDevice device,
       vn_relax_fini(&relax_state);
    }
 
+   const uint64_t elapsed_us = vn_winehua_dx12_elapsed_us(wait_start_ns);
    if (perf_summary) {
-      const int64_t wait_end_ns = os_time_get_nano();
-      const uint64_t elapsed_us = wait_end_ns > wait_start_ns
-         ? (uint64_t)(wait_end_ns - wait_start_ns) / 1000 : 0;
       vn_winehua_record_fence_wait(dev, false, false, status_call_count,
                                    result, elapsed_us);
    } else if (result < 0) {
@@ -2151,6 +2182,7 @@ vn_WaitForFences(VkDevice device,
              "WineHua fence wait mode=polling failed status_calls=%u result=%d",
              status_call_count, result);
    }
+   vn_winehua_dx12_after_fence_wait(elapsed_us);
 
    return vn_result(dev->instance, result);
 }

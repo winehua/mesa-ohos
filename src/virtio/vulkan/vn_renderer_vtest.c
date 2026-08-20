@@ -30,6 +30,7 @@
 #include "vn_image.h"
 #include "vn_queue.h"
 #include "vn_ring.h"
+#include "vn_winehua_dx12_trace.h"
 
 #define VTEST_PCI_VENDOR_ID 0x1af4
 #define VTEST_PCI_DEVICE_ID 0x1050
@@ -1290,7 +1291,10 @@ vn_winehua_present(VkQueue queue_handle,
    struct vn_device *dev = (void *)queue->base.base.base.device;
    const bool drain_perf =
       vn_ring_perf_summary_enabled(dev->primary_ring);
-   const int64_t present_start_ns = drain_perf ? os_time_get_nano() : 0;
+   const bool dx12_trace = vn_winehua_dx12_trace_enabled();
+   const int64_t present_start_ns =
+      (drain_perf || dx12_trace) ? os_time_get_nano() : 0;
+   vn_winehua_dx12_note_start();
    if (vn_winehua_present_image_trace_enabled())
       vn_log(dev->instance,
              "WineHuaPresentImage: layer=guest event=present serial=%u "
@@ -1358,39 +1362,70 @@ vn_winehua_present(VkQueue queue_handle,
    int result = -EAGAIN;
    for (unsigned attempt = 0; attempt < 8 && result == -EAGAIN; attempt++) {
       present_drain_attempts = attempt + 1;
-      const int64_t drain_start_ns =
-         (drain_perf || vtest_winehua_present_trace_enabled())
+      const bool dx12_trace_attempt = dx12_trace;
+      const int64_t roundtrip_start_ns =
+         (drain_perf || vtest_winehua_present_trace_enabled() || dx12_trace_attempt)
             ? os_time_get_nano() : 0;
       vn_ring_roundtrip(dev->primary_ring);
+      const int64_t wait_start_ns = roundtrip_start_ns ? os_time_get_nano() : 0;
+      int wait_all_called = 0;
       if (queue->winehua_last_submit_seqno_valid) {
          vn_ring_wait_seqno(dev->primary_ring,
                             queue->winehua_last_submit_seqno);
       } else {
          const char *roundtrip_only =
             os_get_option("VN_WINEHUA_PRESENT_ROUNDTRIP_ONLY");
-         if (!roundtrip_only || strcmp(roundtrip_only, "1") != 0)
+         if (!roundtrip_only || strcmp(roundtrip_only, "1") != 0) {
             vn_ring_wait_all(dev->primary_ring);
+            wait_all_called = 1;
+         }
       }
-      if (drain_start_ns) {
-         const int64_t drain_end_ns = os_time_get_nano();
-         const uint64_t drain_us = drain_end_ns > drain_start_ns
-            ? (uint64_t)(drain_end_ns - drain_start_ns) / 1000ull : 0;
+      const int64_t wait_end_ns = roundtrip_start_ns ? os_time_get_nano() : 0;
+      if (dx12_trace_attempt) {
+         vn_winehua_dx12_add(&vn_winehua_dx12_acc.present_roundtrip_us,
+                             vn_winehua_dx12_ns_to_us(roundtrip_start_ns,
+                                                      wait_start_ns));
+         vn_winehua_dx12_add(&vn_winehua_dx12_acc.present_wait_seqno_us,
+                             vn_winehua_dx12_ns_to_us(wait_start_ns,
+                                                      wait_end_ns));
+         atomic_store_explicit(&vn_winehua_dx12_acc.writer_seqno,
+                               queue->winehua_last_submit_seqno,
+                               memory_order_relaxed);
+         atomic_store_explicit(&vn_winehua_dx12_acc.writer_seqno_valid,
+                               queue->winehua_last_submit_seqno_valid ? 1 : 0,
+                               memory_order_relaxed);
+         if (wait_all_called)
+            atomic_store_explicit(&vn_winehua_dx12_acc.wait_all_called, 1,
+                                  memory_order_relaxed);
+      }
+      if (roundtrip_start_ns) {
+         const uint64_t drain_us = wait_end_ns > roundtrip_start_ns
+            ? (uint64_t)(wait_end_ns - roundtrip_start_ns) / 1000ull : 0;
+         const uint64_t roundtrip_us = wait_start_ns > roundtrip_start_ns
+            ? (uint64_t)(wait_start_ns - roundtrip_start_ns) / 1000ull : 0;
+         const uint64_t wait_seqno_us = wait_end_ns > wait_start_ns
+            ? (uint64_t)(wait_end_ns - wait_start_ns) / 1000ull : 0;
          present_drain_us += drain_us;
          if (vtest_winehua_present_trace_enabled())
             vn_log(dev->instance,
                    "winehua vk present: ring drained serial=%u attempt=%u wait_us=%" PRIu64
-                   " writer_seqno_valid=%d writer_seqno=%u",
-                   serial, attempt + 1, drain_us,
+                   " roundtrip_us=%" PRIu64 " wait_seqno_us=%" PRIu64
+                   " writer_seqno_valid=%d writer_seqno=%u wait_all=%d",
+                   serial, attempt + 1, drain_us, roundtrip_us, wait_seqno_us,
                    queue->winehua_last_submit_seqno_valid ? 1 : 0,
-                   queue->winehua_last_submit_seqno);
+                   queue->winehua_last_submit_seqno, wait_all_called);
       }
-      const int64_t renderer_start_ns = drain_perf ? os_time_get_nano() : 0;
+      const int64_t renderer_start_ns =
+         (drain_perf || dx12_trace) ? os_time_get_nano() : 0;
       result = vn_renderer_winehua_present(dev->renderer, &present);
-      if (drain_perf) {
+      if (renderer_start_ns) {
          const int64_t renderer_end_ns = os_time_get_nano();
-         if (renderer_end_ns > renderer_start_ns)
-            present_renderer_us +=
-               (uint64_t)(renderer_end_ns - renderer_start_ns) / 1000ull;
+         const uint64_t renderer_us =
+            vn_winehua_dx12_ns_to_us(renderer_start_ns, renderer_end_ns);
+         present_renderer_us += renderer_us;
+         if (dx12_trace)
+            vn_winehua_dx12_add(&vn_winehua_dx12_acc.present_renderer_us,
+                                renderer_us);
       }
       if (result == -EAGAIN) {
          vn_log(dev->instance,
@@ -1511,6 +1546,11 @@ vn_winehua_present(VkQueue queue_handle,
 
    if ((result == 0 || result == 1) && next_present_deadline_ns)
       queue->winehua_next_present_deadline_ns = *next_present_deadline_ns;
+
+   if (dx12_trace && present_start_ns)
+      vn_winehua_dx12_add(&vn_winehua_dx12_acc.present_total_us,
+                          vn_winehua_dx12_ns_to_us(present_start_ns,
+                                                   os_time_get_nano()));
 
    return result;
 }

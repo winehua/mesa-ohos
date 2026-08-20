@@ -22,6 +22,7 @@
 #include "vn_physical_device.h"
 #include "vn_renderer.h"
 #include "vn_renderer_util.h"
+#include "vn_winehua_dx12_trace.h"
 
 /* device memory commands */
 
@@ -64,6 +65,8 @@ vn_device_memory_untrack_mapping(struct vn_device *dev,
    }
    mem->map_offset = 0;
    mem->map_end = 0;
+   mem->winehua_dirty_offset = 0;
+   mem->winehua_dirty_end = 0;
    atomic_store_explicit(&mem->persistent_map_write_seen, false,
                          memory_order_relaxed);
    simple_mtx_unlock(&dev->mapped_memory_mutex);
@@ -77,6 +80,8 @@ vn_device_memory_flush_persistent_mappings(struct vn_device *dev)
 
    VkDevice device = vn_device_to_handle(dev);
    uint32_t flush_count = 0;
+   uint64_t flush_bytes = 0;
+   vn_winehua_dx12_note_start();
 
    /* Vulkan requires host access to VkDeviceMemory to be externally
     * synchronized. The mutex additionally protects this bookkeeping from
@@ -90,18 +95,47 @@ vn_device_memory_flush_persistent_mappings(struct vn_device *dev)
          dev->physical_device->memory_properties
             .memoryTypes[mem_vk->memory_type_index]
             .propertyFlags;
+      const bool write_seen =
+         atomic_load_explicit(&mem->persistent_map_write_seen,
+                              memory_order_relaxed);
+      const bool has_dirty =
+         mem->winehua_dirty_end > mem->winehua_dirty_offset;
+      const VkDeviceSize mapped_size =
+         mem->map_end > mem->map_offset ? mem->map_end - mem->map_offset : 0;
+      /* Gears keeps a small UPLOAD CB/VB mapped and writes it every frame
+       * without Unmap/Flush. Promote tiny Map write-intent to that mapped
+       * window. vkd3d's 8–16 MiB upload chunks stay on explicit dirty ranges
+       * so smoke cannot regress to a 96 MiB whole-heap flush. */
+      const VkDeviceSize small_map_max = 1u * 1024u * 1024u;
+      const VkDeviceSize write_intent_max = 512u;
+      VkDeviceSize flush_offset;
+      VkDeviceSize flush_size;
+
       if (!mem->base_bo ||
           !(property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ||
-          !atomic_load_explicit(&mem->persistent_map_write_seen,
-                                memory_order_relaxed) ||
-          mem->map_end <= mem->map_offset)
+          !mapped_size || (!write_seen && !has_dirty))
          continue;
+
+      if (has_dirty) {
+         flush_offset = mem->winehua_dirty_offset;
+         flush_size = mem->winehua_dirty_end - mem->winehua_dirty_offset;
+         if (flush_size <= write_intent_max && mapped_size <= small_map_max &&
+             mapped_size > flush_size) {
+            flush_offset = mem->map_offset;
+            flush_size = mapped_size;
+         }
+      } else if (mapped_size <= small_map_max) {
+         flush_offset = mem->map_offset;
+         flush_size = mapped_size;
+      } else {
+         continue;
+      }
 
       const VkMappedMemoryRange range = {
          .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
          .memory = vn_device_memory_to_handle(mem),
-         .offset = mem->map_offset,
-         .size = mem->map_end - mem->map_offset,
+         .offset = flush_offset,
+         .size = flush_size,
       };
       const VkResult result =
          vn_FlushMappedMemoryRanges(device, 1, &range);
@@ -113,7 +147,20 @@ vn_device_memory_flush_persistent_mappings(struct vn_device *dev)
          continue;
       }
 
+      /* Drop the dirty union after publish. vkd3d suballocates many D3D12
+       * UPLOAD buffers into one 8–16 MiB VkDeviceMemory; keeping the union
+       * republishes the whole slab on every QueueSubmit (~290 MiB/frame in
+       * D3D12Multithreading). Tiny dedicated maps still republish through
+       * write_seen below. Larger persistent CBs are flushed from vkd3d at
+       * ExecuteCommandLists using the D3D12 resource Width. */
+      mem->winehua_dirty_offset = 0;
+      mem->winehua_dirty_end = 0;
+      if (mapped_size > small_map_max) {
+         atomic_store_explicit(&mem->persistent_map_write_seen, false,
+                               memory_order_relaxed);
+      }
       flush_count++;
+      flush_bytes += range.size;
       if (vn_winehua_persistent_map_trace_enabled()) {
          vn_log(dev->instance,
                 "WineHua persistent-map flush: memory=%" PRIu64
@@ -485,6 +532,8 @@ vn_AllocateMemory(VkDevice device,
 
    list_inithead(&mem->mapped_head);
    atomic_init(&mem->persistent_map_write_seen, false);
+   mem->winehua_dirty_offset = 0;
+   mem->winehua_dirty_end = 0;
    vn_object_set_id(mem, vn_get_next_obj_id(), VK_OBJECT_TYPE_DEVICE_MEMORY);
 
    VkResult result;
@@ -643,7 +692,11 @@ vn_FlushMappedMemoryRanges(VkDevice device,
                            const VkMappedMemoryRange *pMemoryRanges)
 {
    struct vn_device *dev = vn_device_from_handle(device);
+   const bool dx12_trace = vn_winehua_dx12_trace_enabled();
+   const int64_t flush_start_ns = dx12_trace ? os_time_get_nano() : 0;
+   uint64_t flush_bytes = 0;
 
+   vn_winehua_dx12_note_start();
    for (uint32_t i = 0; i < memoryRangeCount; i++) {
       const VkMappedMemoryRange *range = &pMemoryRanges[i];
       struct vn_device_memory *mem =
@@ -656,6 +709,19 @@ vn_FlushMappedMemoryRanges(VkDevice device,
       const VkDeviceSize size = range->size == VK_WHOLE_SIZE
                                    ? mem->map_end - range->offset
                                    : range->size;
+      flush_bytes += size;
+      if (size) {
+         const VkDeviceSize end = range->offset + size;
+         if (mem->winehua_dirty_end <= mem->winehua_dirty_offset) {
+            mem->winehua_dirty_offset = range->offset;
+            mem->winehua_dirty_end = end;
+         } else {
+            if (range->offset < mem->winehua_dirty_offset)
+               mem->winehua_dirty_offset = range->offset;
+            if (end > mem->winehua_dirty_end)
+               mem->winehua_dirty_end = end;
+         }
+      }
       vn_renderer_bo_flush(dev->renderer, mem->base_bo, range->offset, size);
    }
 
@@ -664,11 +730,21 @@ vn_FlushMappedMemoryRanges(VkDevice device,
     * publish the ranges through the existing Venus protocol so the renderer
     * can update the Host mapping before queue submission or fence refresh. */
    const char *remote_sync = os_get_option("VN_WINEHUA_REMOTE_MEMORY_SYNC");
+   VkResult result = VK_SUCCESS;
    if (remote_sync && remote_sync[0] == '1')
-      return vn_call_vkFlushMappedMemoryRanges(dev->primary_ring, device,
-                                               memoryRangeCount, pMemoryRanges);
+      result = vn_call_vkFlushMappedMemoryRanges(dev->primary_ring, device,
+                                                 memoryRangeCount,
+                                                 pMemoryRanges);
 
-   return VK_SUCCESS;
+   if (dx12_trace && memoryRangeCount) {
+      vn_winehua_dx12_add(&vn_winehua_dx12_acc.map_flush_us,
+                          vn_winehua_dx12_ns_to_us(flush_start_ns,
+                                                   os_time_get_nano()));
+      vn_winehua_dx12_add(&vn_winehua_dx12_acc.map_scan_bytes, flush_bytes);
+      vn_winehua_dx12_add(&vn_winehua_dx12_acc.map_ranges, memoryRangeCount);
+   }
+
+   return result;
 }
 
 VkResult
