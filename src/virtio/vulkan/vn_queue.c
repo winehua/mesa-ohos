@@ -1142,6 +1142,8 @@ vn_queue_submit(struct vn_queue_submission *submit)
       }
       submit->external_payload.ring_seqno_valid = true;
       submit->external_payload.ring_seqno = ring_submit.ring_seqno;
+      queue->winehua_last_submit_seqno = ring_submit.ring_seqno;
+      queue->winehua_last_submit_seqno_valid = true;
    }
 
    /* If external fence, track the submission's ring_idx to facilitate

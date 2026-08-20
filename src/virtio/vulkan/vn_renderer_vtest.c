@@ -1344,10 +1344,10 @@ vn_winehua_present(VkQueue queue_handle,
    /* The private present request uses the vtest socket while Vulkan object
     * creation and queue submission travel through the Venus ring.  A Venus
     * roundtrip only inserts a cross-transport marker; it does not wait for the
-    * ring worker to consume commands before returning.  Drain through that
-    * marker before the out-of-band lookup so present cannot acquire the Host
-    * queue mutex ahead of the producer QueueSubmit.  This waits for renderer
-    * decode and the Host driver's QueueSubmit call, not GPU completion.
+    * ring worker to consume QueueSubmit.  Copying the swapchain image then
+    * publishes the previous pose (camera rewind).  Wait the exact writer
+    * seqno from this queue's last vkQueueSubmit.  That is decode + host
+    * QueueSubmit, not GPU completion and not vn_ring_wait_all.
     *
     * Treat -EAGAIN as a bounded object-publication race and retry here.  Never
     * expose that transient errno to Wine: the Vulkan thunk maps a negative
@@ -1362,10 +1362,15 @@ vn_winehua_present(VkQueue queue_handle,
          (drain_perf || vtest_winehua_present_trace_enabled())
             ? os_time_get_nano() : 0;
       vn_ring_roundtrip(dev->primary_ring);
-      const char *roundtrip_only =
-         os_get_option("VN_WINEHUA_PRESENT_ROUNDTRIP_ONLY");
-      if (!roundtrip_only || strcmp(roundtrip_only, "1") != 0)
-         vn_ring_wait_all(dev->primary_ring);
+      if (queue->winehua_last_submit_seqno_valid) {
+         vn_ring_wait_seqno(dev->primary_ring,
+                            queue->winehua_last_submit_seqno);
+      } else {
+         const char *roundtrip_only =
+            os_get_option("VN_WINEHUA_PRESENT_ROUNDTRIP_ONLY");
+         if (!roundtrip_only || strcmp(roundtrip_only, "1") != 0)
+            vn_ring_wait_all(dev->primary_ring);
+      }
       if (drain_start_ns) {
          const int64_t drain_end_ns = os_time_get_nano();
          const uint64_t drain_us = drain_end_ns > drain_start_ns
@@ -1373,8 +1378,11 @@ vn_winehua_present(VkQueue queue_handle,
          present_drain_us += drain_us;
          if (vtest_winehua_present_trace_enabled())
             vn_log(dev->instance,
-                   "winehua vk present: ring drained serial=%u attempt=%u wait_us=%" PRIu64,
-                   serial, attempt + 1, drain_us);
+                   "winehua vk present: ring drained serial=%u attempt=%u wait_us=%" PRIu64
+                   " writer_seqno_valid=%d writer_seqno=%u",
+                   serial, attempt + 1, drain_us,
+                   queue->winehua_last_submit_seqno_valid ? 1 : 0,
+                   queue->winehua_last_submit_seqno);
       }
       const int64_t renderer_start_ns = drain_perf ? os_time_get_nano() : 0;
       result = vn_renderer_winehua_present(dev->renderer, &present);

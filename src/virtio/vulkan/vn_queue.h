@@ -27,6 +27,13 @@ struct vn_queue {
     * present on this queue can safely consume and replace this value. */
    uint64_t winehua_next_present_deadline_ns;
 
+   /* Ring seqno of the last async vkQueueSubmit on this queue. Present must
+    * wait this seqno so the out-of-band vtest copy cannot run before the
+    * writer submit is decoded on the Host. ROUNDTRIP_ONLY only skips
+    * wait_all of unrelated ring commands; it must not skip this wait. */
+   uint32_t winehua_last_submit_seqno;
+   bool winehua_last_submit_seqno_valid;
+
    /* semaphore for gluing vkQueueSubmit feedback commands to
     * vkQueueBindSparse
     */
