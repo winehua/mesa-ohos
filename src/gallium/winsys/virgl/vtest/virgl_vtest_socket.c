@@ -345,6 +345,17 @@ int virgl_vtest_send_get_caps(struct virgl_vtest_winsys *vws,
    if (ret <= 0)
       return 0;
 
+   /* WineHua P0-GL-4: caps 报文长度对账。guest 侧 glsl_level/renderer 都收到了,
+    * 但 max_uniform_block_size(结构中靠后的字段) 是 0 —— 需要确认是不是报文被截短。 */
+   if (getenv("WINEHUA_GUEST_CAPS_LOG")) {
+      fprintf(stderr,
+              "winehua-vtest-caps-hdr: resp_len=%u resp_ver=%u guest_caps_v2_size=%zu "
+              "guest_caps_v1_size=%zu\n",
+              resp_buf[0], resp_buf[1],
+              sizeof(struct virgl_caps_v2), sizeof(struct virgl_caps_v1));
+      fflush(stderr);
+   }
+
    if (resp_buf[1] == 2) {
        struct virgl_caps_v1 dummy;
        uint32_t resp_size = resp_buf[0] - 1;

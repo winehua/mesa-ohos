@@ -642,6 +642,21 @@ dri_init_screen(struct dri_screen *screen,
                          &screen->max_gl_es1_version,
                          &screen->max_gl_es2_version);
 
+   /* WineHua P0-GL-4: guest Mesa 由 caps 推导出的版本面。
+    * 已确认 guest 收到的 caps 是 glsl_level=430, 但 EGL 只广告 ES2 ——
+    * 这一行判定 "版本计算偏低" 还是 "版本对、EGL/DRI config 生成时丢了"。 */
+   if (getenv("WINEHUA_GUEST_CAPS_LOG"))
+   {
+      fprintf(stderr,
+              "winehua-guest-versions: glsl_feature_level=%u core=%d compat=%d es1=%d es2=%d\n",
+              pscreen->caps.glsl_feature_level,
+              screen->max_gl_core_version,
+              screen->max_gl_compat_version,
+              screen->max_gl_es1_version,
+              screen->max_gl_es2_version);
+      fflush(stderr);
+   }
+
    screen->throttle = pscreen->caps.throttle;
    if (pscreen->caps.device_protected_context)
       screen->has_protected_context = true;

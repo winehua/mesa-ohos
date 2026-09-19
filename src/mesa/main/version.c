@@ -552,6 +552,35 @@ compute_version_es2(const struct gl_extensions *extensions,
                          extensions->OES_texture_cube_map_array &&
                          extensions->ARB_texture_stencil8);
 
+   /* WineHua P0-GL-4: guest 收到的 caps 是 glsl_level=430, 但这里只算出 ES2.0,
+    * 必须知道是哪一位条件没满足。逐条打印 (WINEHUA_GUEST_CAPS_LOG=1)。 */
+   if (getenv("WINEHUA_GUEST_CAPS_LOG")) {
+      fprintf(stderr,
+              "winehua-guest-es2-why: ext=%p ver20=%d ver30=%d maxColorAttachments=%u "
+              "half_float_vertex=%d internalformat_query=%d map_buffer_range=%d "
+              "shader_texture_lod=%d oes_texture_float=%d oes_half_float=%d "
+              "oes_half_float_linear=%d texture_rg=%d depth_buffer_float=%d "
+              "framebuffer_object=%d sRGB=%d packed_float=%d texture_array=%d "
+              "texture_shared_exp=%d texture_sRGB=%d transform_feedback=%d "
+              "draw_instanced=%d instanced_arrays=%d ubo=%d texture_snorm=%d "
+              "primitive_restart=%d depth_tex_cube=%d tex_2_10_10_10=%d\n",
+              (const void *)extensions, ver_2_0, ver_3_0, consts->MaxColorAttachments,
+              extensions->ARB_half_float_vertex, extensions->ARB_internalformat_query,
+              extensions->ARB_map_buffer_range, extensions->ARB_shader_texture_lod,
+              extensions->OES_texture_float, extensions->OES_texture_half_float,
+              extensions->OES_texture_half_float_linear, extensions->ARB_texture_rg,
+              extensions->ARB_depth_buffer_float, extensions->ARB_framebuffer_object,
+              extensions->EXT_sRGB, extensions->EXT_packed_float,
+              extensions->EXT_texture_array, extensions->EXT_texture_shared_exponent,
+              extensions->EXT_texture_sRGB, extensions->EXT_transform_feedback,
+              extensions->ARB_draw_instanced, extensions->ARB_instanced_arrays,
+              extensions->ARB_uniform_buffer_object, extensions->EXT_texture_snorm,
+              (extensions->NV_primitive_restart || consts->PrimitiveRestartFixedIndex),
+              extensions->OES_depth_texture_cube_map,
+              extensions->EXT_texture_type_2_10_10_10_REV);
+      fflush(stderr);
+   }
+
    if (ver_3_2) {
       return 32;
    } else if (ver_3_1) {

@@ -190,6 +190,19 @@ void st_init_limits(struct pipe_screen *screen,
       can_ubo = false;
    }
 
+   /* WineHua P0-GL-4: ES3 的唯一绊脚石 —— 打印 can_ubo 判定输入。 */
+   if (getenv("WINEHUA_GUEST_CAPS_LOG")) {
+      fprintf(stderr,
+              "winehua-guest-ubo: ext=%p api=%d pipe_max_constant_buffer_size=%u "
+              "shader_frag_const_buffer0=%d can_ubo=%d ubo_after=%d\n",
+              (void *)extensions, (int)api,
+              screen->caps.max_constant_buffer_size,
+              screen->get_shader_param(screen, PIPE_SHADER_FRAGMENT,
+                                       PIPE_SHADER_CAP_MAX_CONST_BUFFER0_SIZE),
+              can_ubo, extensions->ARB_uniform_buffer_object);
+      fflush(stderr);
+   }
+
    /* Round down to a multiple of 4 to make piglit happy. Bytes are not
     * addressible by UBOs anyway.
     */
@@ -358,6 +371,14 @@ void st_init_limits(struct pipe_screen *screen,
 
       if (pc->MaxInstructions &&
           (options->EmitNoIndirectUniform || pc->MaxUniformBlocks < 12)) {
+         if (getenv("WINEHUA_GUEST_CAPS_LOG")) {
+            fprintf(stderr,
+                    "winehua-guest-ubo-off: sh=%d max_instructions=%d emit_no_indirect_uniform=%d "
+                    "max_uniform_blocks=%d\n",
+                    (int)sh, (int)pc->MaxInstructions,
+                    options->EmitNoIndirectUniform ? 1 : 0, (int)pc->MaxUniformBlocks);
+            fflush(stderr);
+         }
          can_ubo = false;
       }
 
@@ -469,6 +490,11 @@ void st_init_limits(struct pipe_screen *screen,
 
    if (can_ubo) {
       extensions->ARB_uniform_buffer_object = GL_TRUE;
+      if (getenv("WINEHUA_GUEST_CAPS_LOG")) {
+         fprintf(stderr, "winehua-guest-ubo-set: ext=%p api=%d ubo_now=%d can_ubo=%d\n",
+                 (void *)extensions, (int)api, extensions->ARB_uniform_buffer_object, can_ubo);
+         fflush(stderr);
+      }
       c->MaxCombinedUniformBlocks = c->MaxUniformBufferBindings =
          c->Program[MESA_SHADER_VERTEX].MaxUniformBlocks +
          c->Program[MESA_SHADER_TESS_CTRL].MaxUniformBlocks +
@@ -1856,4 +1882,15 @@ void st_init_extensions(struct pipe_screen *screen,
        screen->caps.doubles &&
        !(nir_options->lower_doubles_options & nir_lower_fp64_full_software))
       extensions->NV_copy_depth_to_color = true;
+
+   /* WineHua P0-GL-4: st_init_extensions 结束后 UBO 位是否还在 —— 用于区分
+    * "st_init_extensions 内部清掉" 与 "两个 TU 看到的 struct 布局不一致"。 */
+   if (getenv("WINEHUA_GUEST_CAPS_LOG")) {
+      fprintf(stderr,
+              "winehua-guest-ext-end: ext=%p api=%d ubo=%d essl_feature_level=%u "
+              "glsl_feature_level=%u\n",
+              (void *)extensions, (int)api, extensions->ARB_uniform_buffer_object,
+              screen->caps.essl_feature_level, screen->caps.glsl_feature_level);
+      fflush(stderr);
+   }
 }

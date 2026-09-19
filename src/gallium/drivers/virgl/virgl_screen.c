@@ -1099,6 +1099,35 @@ virgl_create_screen(struct virgl_winsys *vws, const struct pipe_screen_config *c
    virgl_init_screen_resource_functions(&screen->base);
 
    vws->get_caps(vws, &screen->caps);
+   /* WineHua P0-GL-4: guest Mesa 到底从 vtest host 收到什么 caps。
+    * 实测 Host App EGL / VirGL Host EGL / capset 都是 GLES3.2, 但 guest 侧只报
+    * GL2.1、EGL config 里 es3=0 —— 这一行用来判定"caps 根本没收到"还是
+    * "收到了但 Mesa 侧丢掉/没传播"。开关: WINEHUA_GUEST_CAPS_LOG=1 */
+   if (getenv("WINEHUA_GUEST_CAPS_LOG"))
+   {
+      fprintf(stderr,
+              "winehua-guest-caps: glsl_level=%u max_version=%u host_feature_check_version=%u "
+              "renderer=\"%s\" max_render_targets=%u max_texture_2d=%u cap_bits_v2=%#x "
+              "max_uniform_block_size=%u max_anisotropy=%f const_buf_vtx=%u "
+              "max_uniform_blocks_v1=%u const_buffers_vtx=%d "
+              "offset(max_ubo)=%zu offset(renderer)=%zu\n",
+              screen->caps.caps.v1.glsl_level,
+              screen->caps.caps.v1.max_version,
+              screen->caps.caps.v2.host_feature_check_version,
+              screen->caps.caps.v2.renderer,
+              screen->caps.caps.v1.max_render_targets,
+              screen->caps.caps.v2.max_texture_2d_size,
+              screen->caps.caps.v2.capability_bits_v2,
+              screen->caps.caps.v2.max_uniform_block_size,
+              screen->caps.caps.v2.max_anisotropy,
+              screen->caps.caps.v2.max_const_buffer_size[PIPE_SHADER_VERTEX],
+              screen->caps.caps.v1.max_uniform_blocks,
+              virgl_get_shader_param(&screen->base, PIPE_SHADER_VERTEX,
+                                     PIPE_SHADER_CAP_MAX_CONST_BUFFERS),
+              offsetof(struct virgl_caps_v2, max_uniform_block_size),
+              offsetof(struct virgl_caps_v2, renderer));
+      fflush(stderr);
+   }
    fixup_formats(&screen->caps.caps,
                  &screen->caps.caps.v2.supported_readback_formats);
    fixup_formats(&screen->caps.caps, &screen->caps.caps.v2.scanout);
