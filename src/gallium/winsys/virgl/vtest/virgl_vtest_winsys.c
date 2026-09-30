@@ -33,6 +33,7 @@
 
 #include "virgl_vtest_winsys.h"
 #include "virgl_vtest_public.h"
+#include "util/winehua_env.h"
 #include "virtio-gpu/virgl_protocol.h"
 
 /* Gets a pointer to the virgl_hw_res containing the pointed to cache entry. */
@@ -686,7 +687,10 @@ static void virgl_vtest_flush_frontbuffer(struct virgl_winsys *vws,
    struct pipe_box box;
    uint32_t offset = 0;
    const int32_t call = p_atomic_inc_return(&call_count);
-   const char *present_mode = getenv("WINEHUA_VTEST_PRESENT");
+   /* 值感知 (未设/空/"0" = 关): 与 wine 侧 opengl_winehua.c 的开关同语义,
+    * 否则置 "0" 时 wine 不装私有驱动而这里仍跳过上游呈现路径 ⇒ 两头不出图
+    * (见 util/winehua_env.h)。 */
+   const bool present_mode = winehua_env_enabled("WINEHUA_VTEST_PRESENT");
    uint32_t surface_id = 0;
    int present_ret = 0;
 
