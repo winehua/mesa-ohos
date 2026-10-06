@@ -38,6 +38,13 @@ struct pipe_fence_handle;
 struct sw_winsys;
 struct sw_displaytarget;
 
+#define WINEHUA_VTEST_MAX_PRESENT_PACERS 16
+
+struct winehua_vtest_present_pacer {
+   uint32_t surface_id;
+   uint64_t next_present_ns;
+};
+
 struct virgl_vtest_winsys {
    struct virgl_winsys base;
 
@@ -51,6 +58,10 @@ struct virgl_vtest_winsys {
 
    int32_t blob_id;
    unsigned protocol_version;
+   struct winehua_vtest_present_pacer
+      winehua_present_pacers[WINEHUA_VTEST_MAX_PRESENT_PACERS];
+   uint64_t winehua_present_wait_us;
+   uint64_t winehua_present_waits;
 };
 
 struct virgl_hw_res {
@@ -124,6 +135,20 @@ int virgl_vtest_send_resource_unref(struct virgl_vtest_winsys *vws,
 
 int virgl_vtest_submit_cmd(struct virgl_vtest_winsys *vws,
                            uint32_t *buf, uint32_t buf_len);
+
+int virgl_vtest_send_winehua_present(struct virgl_vtest_winsys *vws,
+                                     uint32_t handle,
+                                     uint32_t level,
+                                     uint32_t layer,
+                                     uint32_t format,
+                                     uint32_t bind,
+                                     uint32_t width,
+                                     uint32_t height,
+                                     uintptr_t drawable,
+                                     uint32_t serial,
+                                     uint32_t surface_id);
+
+uint32_t winehua_vtest_get_present_surface_id(void);
 
 int virgl_vtest_send_transfer_get(struct virgl_vtest_winsys *vws,
                                   uint32_t handle,

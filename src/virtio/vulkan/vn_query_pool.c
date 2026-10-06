@@ -15,6 +15,7 @@
 #include "vn_device.h"
 #include "vn_feedback.h"
 #include "vn_physical_device.h"
+#include "vn_ring.h"
 
 /* query pool commands */
 
@@ -443,6 +444,8 @@ vn_GetQueryPoolResults(VkDevice device,
       result = vn_get_query_pool_results(device, queryPool, firstQuery,
                                          queryCount, pData, stride, flags);
    }
+
+
 
    return vn_result(dev->instance, result);
 }

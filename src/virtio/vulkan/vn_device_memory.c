@@ -10,6 +10,8 @@
 
 #include "vn_device_memory.h"
 
+#include "util/os_misc.h"
+
 #include "venus-protocol/vn_protocol_driver_device_memory.h"
 #include "venus-protocol/vn_protocol_driver_transport.h"
 #include "vk_debug_utils.h"
@@ -23,6 +25,109 @@
 #include "vn_renderer_util.h"
 
 /* device memory commands */
+
+static bool
+vn_winehua_persistent_map_sync_enabled(void)
+{
+   static atomic_int cached = ATOMIC_VAR_INIT(-1);
+   int enabled = atomic_load_explicit(&cached, memory_order_relaxed);
+   if (enabled < 0) {
+      const char *value =
+         os_get_option("VN_WINEHUA_PERSISTENT_MAP_SYNC");
+      enabled = value && value[0] == '1' && !value[1];
+      atomic_store_explicit(&cached, enabled, memory_order_relaxed);
+   }
+   return enabled != 0;
+}
+
+static bool
+vn_winehua_persistent_map_trace_enabled(void)
+{
+   static atomic_int cached = ATOMIC_VAR_INIT(-1);
+   int enabled = atomic_load_explicit(&cached, memory_order_relaxed);
+   if (enabled < 0) {
+      const char *value =
+         os_get_option("VN_WINEHUA_PERSISTENT_MAP_SYNC_TRACE");
+      enabled = value && value[0] == '1' && !value[1];
+      atomic_store_explicit(&cached, enabled, memory_order_relaxed);
+   }
+   return enabled != 0;
+}
+
+static void
+vn_device_memory_untrack_mapping(struct vn_device *dev,
+                                 struct vn_device_memory *mem)
+{
+   simple_mtx_lock(&dev->mapped_memory_mutex);
+   if (mem->mapped) {
+      list_delinit(&mem->mapped_head);
+      mem->mapped = false;
+   }
+   mem->map_offset = 0;
+   mem->map_end = 0;
+   atomic_store_explicit(&mem->persistent_map_write_seen, false,
+                         memory_order_relaxed);
+   simple_mtx_unlock(&dev->mapped_memory_mutex);
+}
+
+void
+vn_device_memory_flush_persistent_mappings(struct vn_device *dev)
+{
+   if (!vn_winehua_persistent_map_sync_enabled())
+      return;
+
+   VkDevice device = vn_device_to_handle(dev);
+   uint32_t flush_count = 0;
+
+   /* Vulkan requires host access to VkDeviceMemory to be externally
+    * synchronized. The mutex additionally protects this bookkeeping from
+    * well-behaved applications mapping or unmapping another allocation on a
+    * different thread while the queue is submitted. */
+   simple_mtx_lock(&dev->mapped_memory_mutex);
+   list_for_each_entry(struct vn_device_memory, mem, &dev->mapped_memories,
+                       mapped_head) {
+      const struct vk_device_memory *mem_vk = &mem->base.vk;
+      const VkMemoryPropertyFlags property_flags =
+         dev->physical_device->memory_properties
+            .memoryTypes[mem_vk->memory_type_index]
+            .propertyFlags;
+      if (!mem->base_bo ||
+          !(property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ||
+          !atomic_load_explicit(&mem->persistent_map_write_seen,
+                                memory_order_relaxed) ||
+          mem->map_end <= mem->map_offset)
+         continue;
+
+      const VkMappedMemoryRange range = {
+         .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+         .memory = vn_device_memory_to_handle(mem),
+         .offset = mem->map_offset,
+         .size = mem->map_end - mem->map_offset,
+      };
+      const VkResult result =
+         vn_FlushMappedMemoryRanges(device, 1, &range);
+      if (result != VK_SUCCESS) {
+         vn_log(dev->instance,
+                "WineHua persistent-map flush failed: memory=%" PRIu64
+                " offset=%" PRIu64 " size=%" PRIu64 " result=%d",
+                mem->base.id, range.offset, range.size, result);
+         continue;
+      }
+
+      flush_count++;
+      if (vn_winehua_persistent_map_trace_enabled()) {
+         vn_log(dev->instance,
+                "WineHua persistent-map flush: memory=%" PRIu64
+                " offset=%" PRIu64 " size=%" PRIu64,
+                mem->base.id, range.offset, range.size);
+      }
+   }
+   simple_mtx_unlock(&dev->mapped_memory_mutex);
+
+   if (flush_count && vn_winehua_persistent_map_trace_enabled())
+      vn_log(dev->instance, "WineHua persistent-map submit flushes=%u",
+             flush_count);
+}
 
 static inline VkResult
 vn_device_memory_alloc_simple(struct vn_device *dev,
@@ -379,6 +484,8 @@ vn_AllocateMemory(VkDevice device,
    if (!mem)
       return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   list_inithead(&mem->mapped_head);
+   atomic_init(&mem->persistent_map_write_seen, false);
    vn_object_set_id(mem, vn_get_next_obj_id(), VK_OBJECT_TYPE_DEVICE_MEMORY);
 
    const VkImportMemoryFdInfoKHR *import_fd_info =
@@ -417,6 +524,8 @@ vn_FreeMemory(VkDevice device,
    struct vn_device_memory *mem = vn_device_memory_from_handle(memory);
    if (!mem)
       return;
+
+   vn_device_memory_untrack_mapping(dev, mem);
 
    vn_device_memory_emit_report(dev, mem, /* is_alloc */ false, VK_SUCCESS);
 
@@ -496,7 +605,15 @@ vn_MapMemory2(VkDevice device,
       return vn_error(dev->instance, VK_ERROR_MEMORY_MAP_FAILED);
    }
 
+   mem->map_offset = offset;
    mem->map_end = size == VK_WHOLE_SIZE ? mem_vk->size : offset + size;
+
+   simple_mtx_lock(&dev->mapped_memory_mutex);
+   if (!mem->mapped) {
+      list_addtail(&mem->mapped_head, &dev->mapped_memories);
+      mem->mapped = true;
+   }
+   simple_mtx_unlock(&dev->mapped_memory_mutex);
 
    *ppData = ptr + offset;
 
@@ -506,6 +623,33 @@ vn_MapMemory2(VkDevice device,
 VKAPI_ATTR VkResult VKAPI_CALL
 vn_UnmapMemory2(VkDevice device, const VkMemoryUnmapInfo *pMemoryUnmapInfo)
 {
+   struct vn_device *dev = vn_device_from_handle(device);
+   const VkDeviceMemory memory = pMemoryUnmapInfo->memory;
+   struct vn_device_memory *mem = vn_device_memory_from_handle(memory);
+   const struct vk_device_memory *mem_vk = &mem->base.vk;
+   const VkMemoryPropertyFlags property_flags =
+      dev->physical_device->memory_properties
+         .memoryTypes[mem_vk->memory_type_index]
+         .propertyFlags;
+   const char *remote_sync = os_get_option("VN_WINEHUA_REMOTE_MEMORY_SYNC");
+
+   /* A normal Venus BO maps Host memory directly. WineHua's fallback uses a
+    * separate Guest shadow mapping, so HOST_COHERENT writes made by an app
+    * between Map and Unmap would otherwise never enter the Host dirty list.
+    * Publish the mapped range at the Vulkan synchronization boundary. */
+   if (remote_sync && remote_sync[0] == '1' && mem->base_bo &&
+       (property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) &&
+       mem->map_end > mem->map_offset) {
+      const VkMappedMemoryRange range = {
+         .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+         .memory = memory,
+         .offset = mem->map_offset,
+         .size = mem->map_end - mem->map_offset,
+      };
+      (void)vn_FlushMappedMemoryRanges(device, 1, &range);
+   }
+
+   vn_device_memory_untrack_mapping(dev, mem);
    return VK_SUCCESS;
 }
 
@@ -521,11 +665,24 @@ vn_FlushMappedMemoryRanges(VkDevice device,
       struct vn_device_memory *mem =
          vn_device_memory_from_handle(range->memory);
 
+      if (vn_winehua_persistent_map_sync_enabled())
+         atomic_store_explicit(&mem->persistent_map_write_seen, true,
+                               memory_order_relaxed);
+
       const VkDeviceSize size = range->size == VK_WHOLE_SIZE
                                    ? mem->map_end - range->offset
                                    : range->size;
       vn_renderer_bo_flush(dev->renderer, mem->base_bo, range->offset, size);
    }
+
+   /* WineHua's vtest transport maps an OHOS shadow file rather than the Host
+    * VkDeviceMemory itself.  Its local bo flush is therefore insufficient:
+    * publish the ranges through the existing Venus protocol so the renderer
+    * can update the Host mapping before queue submission or fence refresh. */
+   const char *remote_sync = os_get_option("VN_WINEHUA_REMOTE_MEMORY_SYNC");
+   if (remote_sync && remote_sync[0] == '1')
+      return vn_call_vkFlushMappedMemoryRanges(dev->primary_ring, device,
+                                               memoryRangeCount, pMemoryRanges);
 
    return VK_SUCCESS;
 }
@@ -548,6 +705,12 @@ vn_InvalidateMappedMemoryRanges(VkDevice device,
       vn_renderer_bo_invalidate(dev->renderer, mem->base_bo, range->offset,
                                 size);
    }
+
+   const char *remote_sync = os_get_option("VN_WINEHUA_REMOTE_MEMORY_SYNC");
+   if (remote_sync && remote_sync[0] == '1')
+      return vn_call_vkInvalidateMappedMemoryRanges(dev->primary_ring, device,
+                                                    memoryRangeCount,
+                                                    pMemoryRanges);
 
    return VK_SUCCESS;
 }

@@ -440,6 +440,9 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 vn_GetInstanceProcAddr(VkInstance _instance, const char *pName)
 {
    struct vn_instance *instance = vn_instance_from_handle(_instance);
+   if (pName && !strcmp(pName, "vn_winehua_present"))
+      return (PFN_vkVoidFunction)vn_winehua_present;
+
    return vk_instance_get_proc_addr(&instance->base.vk,
                                     &vn_instance_entrypoints, pName);
 }

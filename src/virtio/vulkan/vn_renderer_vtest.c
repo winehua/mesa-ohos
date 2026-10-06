@@ -19,16 +19,56 @@
 #include "drm-uapi/virtgpu_drm.h"
 #include "util/os_file.h"
 #include "util/os_misc.h"
+#include "util/os_time.h"
 #include "util/sparse_array.h"
 #include "util/u_process.h"
 #include "vtest/vtest_protocol.h"
 
 #include "vn_renderer_internal.h"
+#include "vn_device.h"
+#include "vn_image.h"
+#include "vn_queue.h"
+#include "vn_ring.h"
 
 #define VTEST_PCI_VENDOR_ID 0x1af4
 #define VTEST_PCI_DEVICE_ID 0x1050
 
 struct vtest;
+
+static atomic_uint_fast64_t winehua_present_paced_waits;
+static atomic_uint_fast64_t winehua_present_paced_wait_us;
+static atomic_uint_fast64_t winehua_present_ring_drain_count;
+static atomic_uint_fast64_t winehua_present_ring_drain_total_us;
+static atomic_uint_fast64_t winehua_present_ring_drain_max_us;
+static atomic_uint_fast64_t winehua_present_ring_drain_retries;
+static atomic_uint_fast64_t winehua_present_renderer_total_us;
+static atomic_uint_fast64_t winehua_present_renderer_max_us;
+static atomic_uint_fast64_t winehua_present_total_us;
+static atomic_uint_fast64_t winehua_present_max_us;
+
+static void
+vn_winehua_atomic_max(atomic_uint_fast64_t *value, uint64_t candidate)
+{
+   uint_fast64_t current = atomic_load_explicit(value, memory_order_relaxed);
+   while (current < candidate &&
+          !atomic_compare_exchange_weak_explicit(value, &current, candidate,
+                                                 memory_order_relaxed,
+                                                 memory_order_relaxed))
+      ;
+}
+
+static bool
+vn_winehua_present_image_trace_enabled(void)
+{
+   static atomic_int cached = ATOMIC_VAR_INIT(-1);
+   int enabled = atomic_load_explicit(&cached, memory_order_relaxed);
+   if (enabled < 0) {
+      const char *value = os_get_option("WINEHUA_DXVK_TRACE_PRESENT_IMAGE");
+      enabled = value && value[0] == '1' && !value[1];
+      atomic_store_explicit(&cached, enabled, memory_order_relaxed);
+   }
+   return enabled != 0;
+}
 
 struct vtest_shmem {
    struct vn_renderer_shmem base;
@@ -38,7 +78,7 @@ struct vtest_bo {
    struct vn_renderer_bo base;
 
    uint32_t blob_flags;
-   /* might be closed after mmap */
+   /* Retained on OHOS ARM64 for Wine's WoW64 shared-map alias. */
    int res_fd;
 };
 
@@ -70,6 +110,25 @@ struct vtest {
 
    struct vn_renderer_shmem_cache shmem_cache;
 };
+
+static bool
+vtest_winehua_present_trace_enabled(void)
+{
+   const char *value = os_get_option("VN_WINEHUA_PRESENT_TRACE");
+   return value && value[0] == '1';
+}
+
+/* Diagnostic-only mode for the OHOS Host Vulkan shadow bridge.  It keeps the
+ * Host resource alive after the Guest mmap is released so that the 3-second
+ * shmem cache expiry cannot race a Venus ring/stream.  The resource is then
+ * reclaimed with the vtest connection/context; this is intentionally not a
+ * production lifetime policy. */
+static bool
+vtest_winehua_defer_shmem_unref_enabled(void)
+{
+   const char *value = os_get_option("VN_WINEHUA_DEFER_SHMEM_UNREF");
+   return value && value[0] == '1';
+}
 
 static int
 vtest_connect_socket(struct vn_instance *instance, const char *path)
@@ -537,6 +596,73 @@ vtest_vcmd_submit_cmd2(struct vtest *vtest,
    }
 }
 
+static int
+vtest_vcmd_winehua_vk_present(
+   struct vtest *vtest,
+   const struct vn_renderer_winehua_present *present)
+{
+   const uint32_t header[VTEST_HDR_SIZE] = {
+      [VTEST_CMD_LEN] = VCMD_WINEHUA_VK_PRESENT_SIZE,
+      [VTEST_CMD_ID] = VCMD_WINEHUA_VK_PRESENT,
+   };
+   const uint32_t command[VCMD_WINEHUA_VK_PRESENT_SIZE] = {
+      [VCMD_WINEHUA_VK_PRESENT_PROTOCOL_VERSION] =
+         VCMD_WINEHUA_VK_PRESENT_VERSION,
+      [VCMD_WINEHUA_VK_PRESENT_FLAGS] = present->flags,
+      [VCMD_WINEHUA_VK_PRESENT_QUEUE_ID_LO] = (uint32_t)present->queue_id,
+      [VCMD_WINEHUA_VK_PRESENT_QUEUE_ID_HI] =
+         (uint32_t)(present->queue_id >> 32),
+      [VCMD_WINEHUA_VK_PRESENT_IMAGE_ID_LO] = (uint32_t)present->image_id,
+      [VCMD_WINEHUA_VK_PRESENT_IMAGE_ID_HI] =
+         (uint32_t)(present->image_id >> 32),
+      [VCMD_WINEHUA_VK_PRESENT_WIDTH] = present->width,
+      [VCMD_WINEHUA_VK_PRESENT_HEIGHT] = present->height,
+      [VCMD_WINEHUA_VK_PRESENT_FORMAT] = present->format,
+      [VCMD_WINEHUA_VK_PRESENT_LAYOUT] = present->layout,
+      [VCMD_WINEHUA_VK_PRESENT_SERIAL] = present->serial,
+      [VCMD_WINEHUA_VK_PRESENT_SURFACE_ID] = present->surface_id,
+      [VCMD_WINEHUA_VK_PRESENT_CLIENT_PID] = present->client_pid,
+   };
+   uint32_t reply_header[VTEST_HDR_SIZE];
+   uint32_t reply[VCMD_WINEHUA_VK_PRESENT_REPLY_SIZE];
+
+   if (vtest_winehua_present_trace_enabled())
+      vn_log(vtest->instance,
+             "winehua vk present: write begin serial=%u queue=%" PRIu64
+             " image=%" PRIu64,
+             present->serial, present->queue_id, present->image_id);
+   vtest_write(vtest, header, sizeof(header));
+   vtest_write(vtest, command, sizeof(command));
+   if (vtest_winehua_present_trace_enabled())
+      vn_log(vtest->instance, "winehua vk present: waiting reply serial=%u",
+             present->serial);
+   vtest_read(vtest, reply_header, sizeof(reply_header));
+   if (vtest_winehua_present_trace_enabled())
+      vn_log(vtest->instance,
+             "winehua vk present: reply header serial=%u len=%u id=%u",
+             present->serial, reply_header[VTEST_CMD_LEN],
+             reply_header[VTEST_CMD_ID]);
+   if (reply_header[VTEST_CMD_ID] != VCMD_WINEHUA_VK_PRESENT ||
+       reply_header[VTEST_CMD_LEN] != VCMD_WINEHUA_VK_PRESENT_REPLY_SIZE)
+      return -EPROTO;
+
+   vtest_read(vtest, reply, sizeof(reply));
+   if (reply[VCMD_WINEHUA_VK_PRESENT_REPLY_SERIAL] != present->serial)
+      return -EPROTO;
+
+   if (present->next_present_deadline_ns) {
+      *present->next_present_deadline_ns =
+         (uint64_t)reply[VCMD_WINEHUA_VK_PRESENT_REPLY_DEADLINE_LO] |
+         (uint64_t)reply[VCMD_WINEHUA_VK_PRESENT_REPLY_DEADLINE_HI] << 32;
+   }
+
+   if (vtest_winehua_present_trace_enabled())
+      vn_log(vtest->instance, "winehua vk present: reply status=%d serial=%u",
+             (int32_t)reply[VCMD_WINEHUA_VK_PRESENT_REPLY_STATUS],
+             present->serial);
+   return (int32_t)reply[VCMD_WINEHUA_VK_PRESENT_REPLY_STATUS];
+}
+
 static VkResult
 vtest_sync_write(struct vn_renderer *renderer,
                  struct vn_renderer_sync *_sync,
@@ -650,8 +776,17 @@ vtest_bo_map(struct vn_renderer *renderer,
                 bo->res_fd, bo->base.mmap_size, strerror(errno));
       } else {
          bo->base.mmap_ptr = ptr;
-         /* we don't need the fd anymore */
-         if (!shareable) {
+         /* Native ARM64 Wine may need a second, low-address MAP_SHARED
+          * view after vkMapMemory returns. Keep the backing fd until BO
+          * destruction so it can do this without privileged map_files
+          * access or a whole-allocation CPU copy at every submission.
+          * vtest_bo_destroy closes this fd on every normal destroy path. */
+#if defined(__aarch64__) && defined(__OHOS__)
+         const bool keep_wow64_map_fd = true;
+#else
+         const bool keep_wow64_map_fd = false;
+#endif
+         if (!shareable && !keep_wow64_map_fd) {
             close(bo->res_fd);
             bo->res_fd = -1;
          }
@@ -748,8 +883,19 @@ vtest_shmem_destroy_now(struct vn_renderer *renderer,
 {
    struct vtest *vtest = (struct vtest *)renderer;
    struct vtest_shmem *shmem = (struct vtest_shmem *)_shmem;
+   static atomic_uint_fast64_t deferred_unref_count;
 
    munmap(shmem->base.mmap_ptr, shmem->base.mmap_size);
+
+   if (vtest_winehua_defer_shmem_unref_enabled()) {
+      const uint64_t count = atomic_fetch_add_explicit(
+         &deferred_unref_count, 1, memory_order_relaxed) + 1;
+      if (count <= 8 || !(count % 120))
+         vn_log(vtest->instance,
+                "WineHua shmem unref deferred res=%u size=%zu count=%" PRIu64,
+                shmem->base.res_id, shmem->base.mmap_size, count);
+      return;
+   }
 
    mtx_lock(&vtest->sock_mutex);
    vtest_vcmd_resource_unref(vtest, shmem->base.res_id);
@@ -874,6 +1020,27 @@ vtest_submit(struct vn_renderer *renderer,
    mtx_unlock(&vtest->sock_mutex);
 
    return VK_SUCCESS;
+}
+
+static int
+vtest_winehua_present(
+   struct vn_renderer *renderer,
+   const struct vn_renderer_winehua_present *present)
+{
+   struct vtest *vtest = (struct vtest *)renderer;
+
+   if (vtest_winehua_present_trace_enabled())
+      vn_log(vtest->instance, "winehua vk present: lock socket serial=%u",
+             present->serial);
+   mtx_lock(&vtest->sock_mutex);
+   const int result = vtest_vcmd_winehua_vk_present(vtest, present);
+   mtx_unlock(&vtest->sock_mutex);
+   if (vtest_winehua_present_trace_enabled())
+      vn_log(vtest->instance,
+             "winehua vk present: unlock socket serial=%u result=%d",
+             present->serial, result);
+
+   return result;
 }
 
 static void
@@ -1024,6 +1191,7 @@ vtest_init(struct vtest *vtest)
    vtest->base.ops.destroy = vtest_destroy;
    vtest->base.ops.submit = vtest_submit;
    vtest->base.ops.wait = vtest_wait;
+   vtest->base.ops.winehua_present = vtest_winehua_present;
 
    vtest->base.shmem_ops.create = vtest_shmem_create;
    vtest->base.shmem_ops.destroy = vtest_shmem_destroy;
@@ -1075,4 +1243,238 @@ vn_renderer_create_vtest(struct vn_instance *instance,
       vn_log(vtest->instance, "vtest backend initialized");
 
    return VK_SUCCESS;
+}
+
+__attribute__((visibility("default"))) int
+vn_winehua_present(VkQueue queue_handle,
+                   VkImage image_handle,
+                   uint32_t width,
+                   uint32_t height,
+                   VkFormat format,
+                   VkImageLayout layout,
+                   uint32_t client_pid,
+                   uint32_t surface_id,
+                   uint32_t serial,
+                   uint64_t *next_present_deadline_ns)
+{
+   struct vn_queue *queue = vn_queue_from_handle(queue_handle);
+   struct vn_image *image = vn_image_from_handle(image_handle);
+   if (!queue || !image || !width || !height || !client_pid || !surface_id)
+      return -EINVAL;
+
+   struct vn_device *dev = vn_device_from_vk(queue->base.vk.base.device);
+   const bool drain_perf =
+      vn_ring_perf_summary_enabled(dev->primary_ring);
+   const int64_t present_start_ns = drain_perf ? os_time_get_nano() : 0;
+   if (vn_winehua_present_image_trace_enabled())
+      vn_log(dev->instance,
+             "WineHuaPresentImage: layer=guest event=present serial=%u "
+             "rawImage=0x%" PRIx64 " imageId=%" PRIu64 " queueId=%" PRIu64,
+             serial, (uint64_t)(uintptr_t)image_handle, image->base.id,
+             queue->base.id);
+   const uint64_t pacing_deadline_ns =
+      queue->winehua_next_present_deadline_ns;
+   queue->winehua_next_present_deadline_ns = 0;
+
+   /* Wait for the previous Host-provided deadline only after the application
+    * has rendered its next frame and entered present.  This overlaps game
+    * rendering with the display period instead of serializing render time
+    * after an immediate post-present sleep. */
+   const int64_t pacing_now_ns = os_time_get_nano();
+   if (pacing_now_ns > 0 && pacing_deadline_ns > (uint64_t)pacing_now_ns) {
+      const uint64_t remaining_ns =
+         pacing_deadline_ns - (uint64_t)pacing_now_ns;
+      if (remaining_ns <= 100000000ull) {
+         const int64_t wait_start_ns = os_time_get_nano();
+         os_time_sleep((int64_t)((remaining_ns + 999ull) / 1000ull));
+         const int64_t wait_end_ns = os_time_get_nano();
+         const uint64_t waited_us = wait_end_ns > wait_start_ns
+            ? (uint64_t)(wait_end_ns - wait_start_ns) / 1000ull : 0;
+         const uint64_t wait_count = atomic_fetch_add_explicit(
+            &winehua_present_paced_waits, 1, memory_order_relaxed) + 1;
+         const uint64_t total_us = atomic_fetch_add_explicit(
+            &winehua_present_paced_wait_us, waited_us,
+            memory_order_relaxed) + waited_us;
+         if (drain_perf && (wait_count <= 8 || !(wait_count % 120)))
+            vn_log(dev->instance,
+                   "winehua vk present: paced_waits=%" PRIu64
+                   " last_us=%" PRIu64 " total_us=%" PRIu64,
+                   wait_count, waited_us, total_us);
+      }
+   }
+
+   const struct vn_renderer_winehua_present present = {
+      .queue_id = queue->base.id,
+      .image_id = image->base.id,
+      .width = width,
+      .height = height,
+      .format = format,
+      .layout = layout,
+      .client_pid = client_pid,
+      .surface_id = surface_id,
+      .serial = serial,
+      .next_present_deadline_ns = next_present_deadline_ns,
+   };
+
+   /* The private present request uses the vtest socket while Vulkan object
+    * creation and queue submission travel through the Venus ring.  A Venus
+    * roundtrip only inserts a cross-transport marker; it does not wait for the
+    * ring worker to consume commands before returning.  Drain through that
+    * marker before the out-of-band lookup so present cannot acquire the Host
+    * queue mutex ahead of the producer QueueSubmit.  This waits for renderer
+    * decode and the Host driver's QueueSubmit call, not GPU completion.
+    *
+    * Treat -EAGAIN as a bounded object-publication race and retry here.  Never
+    * expose that transient errno to Wine: the Vulkan thunk maps a negative
+    * result to DEVICE_LOST, poisoning an otherwise valid x86 process. */
+   uint64_t present_drain_us = 0;
+   uint64_t present_renderer_us = 0;
+   unsigned present_drain_attempts = 0;
+   int result = -EAGAIN;
+   for (unsigned attempt = 0; attempt < 8 && result == -EAGAIN; attempt++) {
+      present_drain_attempts = attempt + 1;
+      const int64_t drain_start_ns =
+         (drain_perf || vtest_winehua_present_trace_enabled())
+            ? os_time_get_nano() : 0;
+      vn_ring_roundtrip(dev->primary_ring);
+      vn_ring_wait_all(dev->primary_ring);
+      if (drain_start_ns) {
+         const int64_t drain_end_ns = os_time_get_nano();
+         const uint64_t drain_us = drain_end_ns > drain_start_ns
+            ? (uint64_t)(drain_end_ns - drain_start_ns) / 1000ull : 0;
+         present_drain_us += drain_us;
+         if (vtest_winehua_present_trace_enabled())
+            vn_log(dev->instance,
+                   "winehua vk present: ring drained serial=%u attempt=%u wait_us=%" PRIu64,
+                   serial, attempt + 1, drain_us);
+      }
+      const int64_t renderer_start_ns = drain_perf ? os_time_get_nano() : 0;
+      result = vn_renderer_winehua_present(dev->renderer, &present);
+      if (drain_perf) {
+         const int64_t renderer_end_ns = os_time_get_nano();
+         if (renderer_end_ns > renderer_start_ns)
+            present_renderer_us +=
+               (uint64_t)(renderer_end_ns - renderer_start_ns) / 1000ull;
+      }
+      if (result == -EAGAIN) {
+         vn_log(dev->instance,
+                "winehua vk present: object publication pending serial=%u attempt=%u",
+                serial, attempt + 1);
+         usleep(1000u << attempt);
+      }
+   }
+
+   if (drain_perf) {
+      const int64_t present_end_ns = os_time_get_nano();
+      const uint64_t present_us = present_end_ns > present_start_ns
+         ? (uint64_t)(present_end_ns - present_start_ns) / 1000ull : 0;
+      const uint64_t count = atomic_fetch_add_explicit(
+         &winehua_present_ring_drain_count, 1, memory_order_relaxed) + 1;
+      const uint64_t total_us = atomic_fetch_add_explicit(
+         &winehua_present_ring_drain_total_us, present_drain_us,
+         memory_order_relaxed) + present_drain_us;
+      vn_winehua_atomic_max(&winehua_present_ring_drain_max_us,
+                            present_drain_us);
+      const uint64_t renderer_total_us = atomic_fetch_add_explicit(
+         &winehua_present_renderer_total_us, present_renderer_us,
+         memory_order_relaxed) + present_renderer_us;
+      vn_winehua_atomic_max(&winehua_present_renderer_max_us,
+                            present_renderer_us);
+      const uint64_t present_total_us = atomic_fetch_add_explicit(
+         &winehua_present_total_us, present_us, memory_order_relaxed) +
+         present_us;
+      vn_winehua_atomic_max(&winehua_present_max_us, present_us);
+      const uint64_t retries = present_drain_attempts > 1
+         ? atomic_fetch_add_explicit(
+              &winehua_present_ring_drain_retries,
+              present_drain_attempts - 1, memory_order_relaxed) +
+              present_drain_attempts - 1
+         : atomic_load_explicit(&winehua_present_ring_drain_retries,
+                                memory_order_relaxed);
+      if (count <= 8 || !(count % 120)) {
+         struct vn_ring_perf_stats ring_stats;
+         vn_ring_get_perf_stats(dev->primary_ring, &ring_stats);
+         struct vn_ring_perf_reply_stat
+            top_replies[VN_RING_PERF_TOP_REPLY_COUNT];
+         vn_ring_get_perf_top_replies(dev->primary_ring, top_replies);
+         char reply_summary[512] = { 0 };
+         size_t reply_summary_len = 0;
+         for (uint32_t i = 0; i < VN_RING_PERF_TOP_REPLY_COUNT; i++) {
+            if (!top_replies[i].count)
+               break;
+            const int written = snprintf(
+               reply_summary + reply_summary_len,
+               sizeof(reply_summary) - reply_summary_len,
+               "%s%u:%" PRIu64 ":%" PRIu64 ":%" PRIu64,
+               reply_summary_len ? "," : "", top_replies[i].command_type,
+               top_replies[i].count, top_replies[i].total_us,
+               top_replies[i].max_us);
+            if (written < 0 || (size_t)written >=
+                  sizeof(reply_summary) - reply_summary_len)
+               break;
+            reply_summary_len += written;
+         }
+         const uint64_t paced_waits = atomic_load_explicit(
+            &winehua_present_paced_waits, memory_order_relaxed);
+         const uint64_t paced_wait_us = atomic_load_explicit(
+            &winehua_present_paced_wait_us, memory_order_relaxed);
+         vn_log(dev->instance,
+                "WineHuaGuestFramePerf: presents=%" PRIu64
+                " present_us=%" PRIu64 "/%" PRIu64 "/%" PRIuFAST64
+                " drain_us=%" PRIu64 "/%" PRIu64 "/%" PRIuFAST64
+                " renderer_us=%" PRIu64 "/%" PRIu64 "/%" PRIuFAST64
+                " retries=%" PRIu64 " paced=%" PRIu64 "/%" PRIu64
+                " ring_submit=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+                " ring_mutex=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+                " ring_seqno=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+                " ring_space=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+                " roundtrip_submit=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+                " roundtrip_wait=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+                " notify=%" PRIu64 "/%" PRIu64 "/%" PRIu64
+                " fence_status=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+                " query_results=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+                " reply_top=%s",
+                count,
+                present_total_us, present_total_us / count,
+                atomic_load_explicit(&winehua_present_max_us,
+                                     memory_order_relaxed),
+                total_us, total_us / count,
+                atomic_load_explicit(&winehua_present_ring_drain_max_us,
+                                     memory_order_relaxed),
+                renderer_total_us, renderer_total_us / count,
+                atomic_load_explicit(&winehua_present_renderer_max_us,
+                                     memory_order_relaxed),
+                retries, paced_waits, paced_wait_us,
+                ring_stats.submit_count, ring_stats.submit_bytes,
+                ring_stats.submit_total_us, ring_stats.submit_max_us,
+                ring_stats.mutex_wait_count, ring_stats.mutex_wait_total_us,
+                ring_stats.mutex_wait_max_us,
+                ring_stats.seqno_wait_count, ring_stats.seqno_wait_total_us,
+                ring_stats.seqno_wait_max_us,
+                ring_stats.space_wait_count, ring_stats.space_wait_total_us,
+                ring_stats.space_wait_max_us,
+                ring_stats.roundtrip_submit_count,
+                ring_stats.roundtrip_submit_total_us,
+                ring_stats.roundtrip_submit_max_us,
+                ring_stats.roundtrip_wait_count,
+                ring_stats.roundtrip_wait_total_us,
+                ring_stats.roundtrip_wait_max_us,
+                ring_stats.notify_count, ring_stats.notify_total_us,
+                ring_stats.notify_max_us,
+                ring_stats.fence_status_count,
+                ring_stats.fence_status_total_us,
+                ring_stats.fence_status_max_us,
+                ring_stats.fence_status_not_ready,
+                ring_stats.query_results_count,
+                ring_stats.query_results_total_us,
+                ring_stats.query_results_max_us,
+                ring_stats.query_results_not_ready,
+                reply_summary);
+      }
+   }
+
+   if ((result == 0 || result == 1) && next_present_deadline_ns)
+      queue->winehua_next_present_deadline_ns = *next_present_deadline_ns;
+
+   return result;
 }

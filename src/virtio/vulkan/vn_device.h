@@ -27,6 +27,9 @@ struct vn_device {
    struct vn_renderer *renderer;
    struct vn_ring *primary_ring;
 
+   struct list_head mapped_memories;
+   simple_mtx_t mapped_memory_mutex;
+
    /* unique queue family indices in which to create the device queues */
    uint32_t *queue_families;
    uint32_t queue_family_count;

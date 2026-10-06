@@ -3,6 +3,7 @@
 		vk_icdGetInstanceProcAddr;
 		vk_icdGetPhysicalDeviceProcAddr;
 		vk_icdNegotiateLoaderICDInterfaceVersion;
+		vn_winehua_present;
 
 	local:
 		# When static linking LLVM, all its symbols are public API.

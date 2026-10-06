@@ -23,9 +23,14 @@
 
 #include <sys/socket.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <netinet/in.h>
+#include <sys/mman.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <util/format/u_format.h>
@@ -33,6 +38,47 @@
 
 #include "virgl_vtest_winsys.h"
 #include "virgl_vtest_public.h"
+
+#define WINEHUA_PRESENT_SURFACE_MAGIC 0x57535053u
+#define WINEHUA_PRESENT_SURFACE_VERSION 1u
+
+struct winehua_present_surface_page {
+   uint32_t magic;
+   uint32_t version;
+   uint32_t surface_id;
+   uint32_t reserved;
+};
+
+static pthread_mutex_t winehua_present_surface_mutex = PTHREAD_MUTEX_INITIALIZER;
+static const struct winehua_present_surface_page *winehua_present_surface_page;
+
+static void
+winehua_vtest_map_present_surface_page(void)
+{
+   const char *tmp_dir = getenv("TMPDIR");
+   const struct winehua_present_surface_page *page;
+   char path[256];
+   int fd;
+
+   if (!tmp_dir || !tmp_dir[0] ||
+       snprintf(path, sizeof(path), "%s/winehua_present_surface_%u.shm",
+                tmp_dir, (uint32_t)getpid()) >= sizeof(path))
+      return;
+   fd = open(path, O_RDONLY | O_CLOEXEC);
+   if (fd < 0)
+      return;
+   page = mmap(NULL, sizeof(*page), PROT_READ, MAP_SHARED, fd, 0);
+   close(fd);
+   if (page == MAP_FAILED)
+      return;
+   if (__atomic_load_n(&page->magic, __ATOMIC_ACQUIRE) !=
+          WINEHUA_PRESENT_SURFACE_MAGIC ||
+       page->version != WINEHUA_PRESENT_SURFACE_VERSION) {
+      munmap((void *)page, sizeof(*page));
+      return;
+   }
+   __atomic_store_n(&winehua_present_surface_page, page, __ATOMIC_RELEASE);
+}
 
 /* block read/write routines */
 static int virgl_block_write(int fd, void *buf, int size)
@@ -72,6 +118,58 @@ static int virgl_block_read(int fd, void *buf, int size)
       ptr += ret;
    } while (left);
    return size;
+}
+
+static uint64_t
+winehua_now_ns(void)
+{
+   struct timespec now;
+
+   return clock_gettime(CLOCK_MONOTONIC, &now) == 0
+      ? (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec : 0;
+}
+
+static uint64_t
+winehua_wait_until_ns(uint64_t deadline_ns)
+{
+   const uint64_t started_ns = winehua_now_ns();
+   uint64_t now_ns = started_ns;
+
+   while (now_ns && now_ns < deadline_ns) {
+      const uint64_t remaining_ns = deadline_ns - now_ns;
+      struct timespec delay = {
+         .tv_sec = (time_t)(remaining_ns / 1000000000ull),
+         .tv_nsec = (long)(remaining_ns % 1000000000ull),
+      };
+      while (nanosleep(&delay, &delay) < 0 && errno == EINTR)
+         ;
+      now_ns = winehua_now_ns();
+   }
+
+   return started_ns && now_ns > started_ns
+      ? (now_ns - started_ns) / 1000ull : 0;
+}
+
+static struct winehua_vtest_present_pacer *
+winehua_get_present_pacer(struct virgl_vtest_winsys *vws, uint32_t surface_id)
+{
+   struct winehua_vtest_present_pacer *empty = NULL;
+
+   for (unsigned i = 0; i < WINEHUA_VTEST_MAX_PRESENT_PACERS; i++) {
+      struct winehua_vtest_present_pacer *pacer =
+         &vws->winehua_present_pacers[i];
+      if (pacer->surface_id == surface_id)
+         return pacer;
+      if (!pacer->surface_id && !empty)
+         empty = pacer;
+   }
+
+   if (!empty)
+      empty = &vws->winehua_present_pacers[
+         surface_id % WINEHUA_VTEST_MAX_PRESENT_PACERS];
+   empty->surface_id = surface_id;
+   empty->next_present_ns = 0;
+   return empty;
 }
 
 static int virgl_vtest_receive_fd(int socket_fd)
@@ -247,6 +345,17 @@ int virgl_vtest_send_get_caps(struct virgl_vtest_winsys *vws,
    if (ret <= 0)
       return 0;
 
+   /* WineHua P0-GL-4: caps 报文长度对账。guest 侧 glsl_level/renderer 都收到了,
+    * 但 max_uniform_block_size(结构中靠后的字段) 是 0 —— 需要确认是不是报文被截短。 */
+   if (getenv("WINEHUA_GUEST_CAPS_LOG")) {
+      fprintf(stderr,
+              "winehua-vtest-caps-hdr: resp_len=%u resp_ver=%u guest_caps_v2_size=%zu "
+              "guest_caps_v1_size=%zu\n",
+              resp_buf[0], resp_buf[1],
+              sizeof(struct virgl_caps_v2), sizeof(struct virgl_caps_v1));
+      fflush(stderr);
+   }
+
    if (resp_buf[1] == 2) {
        struct virgl_caps_v1 dummy;
        uint32_t resp_size = resp_buf[0] - 1;
@@ -391,6 +500,94 @@ int virgl_vtest_submit_cmd(struct virgl_vtest_winsys *vws,
    virgl_block_write(vws->sock_fd, &vtest_hdr, sizeof(vtest_hdr));
    virgl_block_write(vws->sock_fd, buf, 4 * buf_len);
    return 0;
+}
+
+int virgl_vtest_send_winehua_present(struct virgl_vtest_winsys *vws,
+                                     uint32_t handle,
+                                     uint32_t level,
+                                     uint32_t layer,
+                                     uint32_t format,
+                                     uint32_t bind,
+                                     uint32_t width,
+                                     uint32_t height,
+                                     uintptr_t drawable,
+                                     uint32_t serial,
+                                     uint32_t surface_id)
+{
+   static const uint64_t max_deadline_ahead_ns = 50000000ull;
+   uint32_t header[VTEST_HDR_SIZE] = {
+      [VTEST_CMD_LEN] = VCMD_WINEHUA_PRESENT_SIZE,
+      [VTEST_CMD_ID] = VCMD_WINEHUA_PRESENT,
+   };
+   uint32_t command[VCMD_WINEHUA_PRESENT_SIZE] = {
+      [VCMD_WINEHUA_PRESENT_PROTOCOL_VERSION] = VCMD_WINEHUA_PRESENT_VERSION,
+      [VCMD_WINEHUA_PRESENT_FLAGS] = 0,
+      [VCMD_WINEHUA_PRESENT_RES_HANDLE] = handle,
+      [VCMD_WINEHUA_PRESENT_LEVEL] = level,
+      [VCMD_WINEHUA_PRESENT_LAYER] = layer,
+      [VCMD_WINEHUA_PRESENT_FORMAT] = format,
+      [VCMD_WINEHUA_PRESENT_BIND] = bind,
+      [VCMD_WINEHUA_PRESENT_WIDTH] = width,
+      [VCMD_WINEHUA_PRESENT_HEIGHT] = height,
+      [VCMD_WINEHUA_PRESENT_DRAWABLE_LO] = (uint32_t)drawable,
+      [VCMD_WINEHUA_PRESENT_DRAWABLE_HI] =
+         (uint32_t)((uint64_t)drawable >> 32),
+      [VCMD_WINEHUA_PRESENT_SERIAL] = serial,
+      [VCMD_WINEHUA_PRESENT_SURFACE_ID] = surface_id,
+      [VCMD_WINEHUA_PRESENT_CLIENT_PID] = (uint32_t)getpid(),
+   };
+   uint32_t reply_header[VTEST_HDR_SIZE];
+   uint32_t reply[VCMD_WINEHUA_PRESENT_REPLY_SIZE];
+   struct winehua_vtest_present_pacer *pacer =
+      winehua_get_present_pacer(vws, surface_id);
+
+   for (unsigned attempt = 0; attempt < 8; attempt++) {
+      const uint64_t waited_us =
+         winehua_wait_until_ns(pacer->next_present_ns);
+      if (waited_us) {
+         vws->winehua_present_wait_us += waited_us;
+         vws->winehua_present_waits++;
+      }
+      pacer->next_present_ns = 0;
+
+      int ret = virgl_block_write(vws->sock_fd, header, sizeof(header));
+      if (ret < 0)
+         return ret;
+      ret = virgl_block_write(vws->sock_fd, command, sizeof(command));
+      if (ret < 0)
+         return ret;
+
+      ret = virgl_block_read(vws->sock_fd, reply_header, sizeof(reply_header));
+      if (ret < 0)
+         return ret;
+      ret = virgl_block_read(vws->sock_fd, reply, sizeof(reply));
+      if (ret < 0)
+         return ret;
+      if (reply_header[VTEST_CMD_LEN] != VCMD_WINEHUA_PRESENT_REPLY_SIZE ||
+          reply_header[VTEST_CMD_ID] != VCMD_WINEHUA_PRESENT ||
+          reply[VCMD_WINEHUA_PRESENT_REPLY_SERIAL] != serial)
+         return -EPROTO;
+
+      const int status =
+         (int32_t)reply[VCMD_WINEHUA_PRESENT_REPLY_STATUS];
+      uint64_t next_deadline_ns =
+         (uint64_t)reply[VCMD_WINEHUA_PRESENT_REPLY_DEADLINE_LO] |
+         (uint64_t)reply[VCMD_WINEHUA_PRESENT_REPLY_DEADLINE_HI] << 32;
+      const uint64_t now_ns = winehua_now_ns();
+      if (next_deadline_ns > now_ns &&
+          next_deadline_ns - now_ns > max_deadline_ahead_ns)
+         next_deadline_ns = now_ns + max_deadline_ahead_ns;
+      pacer->next_present_ns = next_deadline_ns;
+
+      if (status == 0)
+         return 0;
+      if (status < 0)
+         return status;
+      if (status != 1 || !next_deadline_ns)
+         return -EPROTO;
+   }
+
+   return -EAGAIN;
 }
 
 int virgl_vtest_send_resource_unref(struct virgl_vtest_winsys *vws,
@@ -594,4 +791,20 @@ virgl_vtest_send_create_blob(struct virgl_vtest_winsys *vws,
 
    return res_id;
 }
+uint32_t winehua_vtest_get_present_surface_id(void)
+{
+   const struct winehua_present_surface_page *page =
+      __atomic_load_n(&winehua_present_surface_page, __ATOMIC_ACQUIRE);
 
+   if (!page) {
+      pthread_mutex_lock(&winehua_present_surface_mutex);
+      page = __atomic_load_n(&winehua_present_surface_page, __ATOMIC_RELAXED);
+      if (!page) {
+         winehua_vtest_map_present_surface_page();
+         page = __atomic_load_n(&winehua_present_surface_page,
+                                __ATOMIC_RELAXED);
+      }
+      pthread_mutex_unlock(&winehua_present_surface_mutex);
+   }
+   return page ? __atomic_load_n(&page->surface_id, __ATOMIC_ACQUIRE) : 0;
+}

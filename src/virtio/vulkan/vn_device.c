@@ -19,6 +19,7 @@
 #include "vn_physical_device.h"
 #include "vn_queue.h"
 #include "vn_ring.h"
+#include "vn_renderer.h"
 
 /* device commands */
 
@@ -617,6 +618,9 @@ vn_CreateDevice(VkPhysicalDevice physicalDevice,
 
    *pDevice = vn_device_to_handle(dev);
 
+   list_inithead(&dev->mapped_memories);
+   simple_mtx_init(&dev->mapped_memory_mutex, mtx_plain);
+
    return VK_SUCCESS;
 }
 
@@ -632,6 +636,8 @@ vn_DestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator)
       return;
 
    assert(list_is_empty(&dev->chains));
+   assert(list_is_empty(&dev->mapped_memories));
+   simple_mtx_destroy(&dev->mapped_memory_mutex);
    simple_mtx_destroy(&dev->mutex);
 
    vn_image_reqs_cache_fini(dev);
@@ -667,6 +673,12 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
 vn_GetDeviceProcAddr(VkDevice device, const char *pName)
 {
    struct vn_device *dev = vn_device_from_handle(device);
+   /* WineHua's private present bridge is intentionally not a Vulkan API
+    * entrypoint, but exposing it through the already-loaded ICD keeps the
+    * caller from dlopen'ing this library again while a Vulkan call is active. */
+   if (pName && !strcmp(pName, "vn_winehua_present"))
+      return (PFN_vkVoidFunction)vn_winehua_present;
+
    return vk_device_get_proc_addr(&dev->base.vk, pName);
 }
 

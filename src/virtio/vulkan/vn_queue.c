@@ -15,14 +15,17 @@
 
 #include "vn_command_buffer.h"
 #include "vn_device.h"
+#include "vn_device_memory.h"
 #include "vn_feedback.h"
 #include "vn_physical_device.h"
 #include "vn_renderer.h"
+
 #include "vn_sync.h"
 #include "vn_wsi.h"
 
 struct vn_queue_submission_pnext {
    /* intercepted structs */
+
    VkDeviceGroupSubmitInfo group;
    VkTimelineSemaphoreSubmitInfo timeline;
 
@@ -1106,6 +1109,7 @@ vn_queue_submission_cleanup_semaphore_feedback(
       /* sfb pending cmds are recycled when signaled counter is updated */
       uint64_t counter = 0;
       vn_GetSemaphoreCounterValue(dev_handle, sem_handle, &counter);
+
    }
 
    const uint32_t signal_count = vn_get_signal_semaphore_count(submit);
@@ -1251,6 +1255,8 @@ vn_queue_submit(struct vn_queue_submission *submit)
    result = vn_queue_submission_prepare_submit(submit);
    if (result != VK_SUCCESS)
       return vn_error(dev->instance, result);
+
+   vn_device_memory_flush_persistent_mappings(dev);
 
    result = vn_queue_submission_do_submit(submit);
    if (result != VK_SUCCESS)
