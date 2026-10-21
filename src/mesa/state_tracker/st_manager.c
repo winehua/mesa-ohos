@@ -58,6 +58,7 @@
 #include "util/u_helpers.h"
 #include "util/u_pointer.h"
 #include "util/u_inlines.h"
+#include "util/winehua_env.h"
 #include "util/u_atomic.h"
 #include "util/u_surface.h"
 #include "util/list.h"
@@ -1203,7 +1204,7 @@ st_manager_flush_frontbuffer(struct st_context *st)
     */
    if (st->ctx->Visual.doubleBufferMode &&
        !stfb->Visual.doubleBufferMode &&
-       !getenv("WINEHUA_VTEST_PRESENT"))
+       !winehua_env_enabled("WINEHUA_VTEST_PRESENT"))
       return;
 
    /* Check front buffer used at the GL API level. */
